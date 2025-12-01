@@ -1,207 +1,260 @@
 `timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: CECS 361 Final Project
+// Engineer: Nathan Sarkozy
+// 
+// Create Date: 11/30/2025 05:54:44 PM
+// Design Name: SPI_master_tb
+// Module Name: SPI_master_tb
+// Project Name: Compass
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
 
-module SPI_master_tb();
+module SPI_master_tb;
 
-  // Testbench signals
-  parameter CLK_PERIOD = 10; // 100MHz clock
-  parameter SPI_MODE = 0;
-  parameter CLKS_PER_HALF_BIT = 1; // Faster for simulation (was 2)
-  
-  // Clock and reset
-  reg r_Clk = 0;
-  reg r_Rst_L = 1;
-  
-  // Master signals
-  reg [7:0] r_Master_TX_Byte;
-  reg r_Master_TX_DV;
-  wire w_Master_TX_Ready;
-  wire w_Master_RX_DV;
-  wire [7:0] w_Master_RX_Byte;
-  
-  // SPI Interface wires
-  wire w_SPI_Clk;
-  wire w_SPI_MOSI;
-  reg w_SPI_MISO = 0;
-  
-  // Clock generation
-  always #(CLK_PERIOD/2) r_Clk = ~r_Clk;
-  
-  // Instantiate SPI Master
-  SPI_Master #(
-    .SPI_MODE(SPI_MODE),
-    .CLKS_PER_HALF_BIT(CLKS_PER_HALF_BIT)
-  ) UUT_SPI_Master (
-    // Control/Data Signals
-    .i_Rst_L(r_Rst_L),
-    .i_Clk(r_Clk),
+    // Inputs
+    reg iclk;
+    wire cs;
+    wire sclk;
+    reg miso;
+    wire mosi;
+    wire [14:0] acl_data;
     
-    // TX (MOSI) Signals
-    .i_TX_Byte(r_Master_TX_Byte),
-    .i_TX_DV(r_Master_TX_DV),
-    .o_TX_Ready(w_Master_TX_Ready),
+    // Testbench variables
+    reg [15:0] x_data = 16'h0000;
+    reg [15:0] y_data = 16'h0000;
+    reg [15:0] z_data = 16'h0000;
     
-    // RX (MISO) Signals
-    .o_RX_DV(w_Master_RX_DV),
-    .o_RX_Byte(w_Master_RX_Byte),
-
-    // SPI Interface
-    .o_SPI_Clk(w_SPI_Clk),
-    .i_SPI_MISO(w_SPI_MISO),
-    .o_SPI_MOSI(w_SPI_MOSI)
-  );
-
-
-  // Test tracking variables
-  integer test_count;
-  integer pass_count;
-  integer fail_count;
-  integer i; // Loop variable
-  
-  // Expected data patterns for verification
-  reg [7:0] expected_rx_data [0:7];
-  reg [7:0] test_tx_data [0:7];
-  integer test_index;
-  
-  // Waveform monitoring signals
-  reg [7:0] current_tx_data;
-  reg [7:0] current_expected_rx;
-  reg [7:0] current_actual_rx;
-  reg [7:0] current_test_number;
-  reg test_passed;
-  reg test_in_progress;
-  
-  // Initialize test vectors
-  initial begin
-    test_count = 0;
-    pass_count = 0;
-    fail_count = 0;
-    test_index = 0;
+    // Test tracking
+    integer test_case = 0;
+    integer tests_passed = 0;
+    integer tests_failed = 0;
     
-    // Initialize monitoring signals
-    current_tx_data = 8'h00;
-    current_expected_rx = 8'h00;
-    current_actual_rx = 8'h00;
-    current_test_number = 8'h00;
-    test_passed = 1'b0;
-    test_in_progress = 1'b0;
+    // Expected results storage
+    reg [14:0] expected_combined;
+    reg [4:0] expected_x, expected_y, expected_z;
     
-    // Test data patterns
-    test_tx_data[0] = 8'hC1;  expected_rx_data[0] = 8'hAA;
-    test_tx_data[1] = 8'hBE;  expected_rx_data[1] = 8'hAB;
-    test_tx_data[2] = 8'hEF;  expected_rx_data[2] = 8'hAC;
-    test_tx_data[3] = 8'h0B;  expected_rx_data[3] = 8'hAD;
-    test_tx_data[4] = 8'h08;  expected_rx_data[4] = 8'hAE;
-    test_tx_data[5] = 8'h5A;  expected_rx_data[5] = 8'hAF;
-    test_tx_data[6] = 8'h3C;  expected_rx_data[6] = 8'hB0;
-    test_tx_data[7] = 8'hFF;  expected_rx_data[7] = 8'hB1;
-  end
-  
-  // MISO data generator with predictable pattern
-  reg [7:0] miso_data = 8'hAA;
-  reg [2:0] bit_counter = 0;
-  
-  always @(negedge w_SPI_Clk) begin
-    w_SPI_MISO <= miso_data[7-bit_counter];
-    bit_counter <= bit_counter + 1;
-    if (bit_counter == 7) begin
-      miso_data <= miso_data + 1;
-    end
-  end
-
-  // Task for sending and verifying SPI data
-  task SendAndVerify(input [7:0] tx_data, input [7:0] expected_rx);
-    reg [7:0] actual_rx;
-    begin
-      // Update test tracking signals
-      test_count = test_count + 1;
-      current_test_number = test_count;
-      current_tx_data = tx_data;
-      current_expected_rx = expected_rx;
-      test_in_progress = 1'b1;
-      
-      // Wait for ready
-      while (!w_Master_TX_Ready) @(posedge r_Clk);
-      
-      // Send byte
-      @(posedge r_Clk);
-      r_Master_TX_Byte <= tx_data;
-      r_Master_TX_DV   <= 1'b1;
-      @(posedge r_Clk);
-      r_Master_TX_DV <= 1'b0;
-      
-      // Wait for transmission to complete
-      while (w_Master_TX_Ready) @(posedge r_Clk);
-      while (!w_Master_TX_Ready) @(posedge r_Clk);
-      
-      // Check received data
-      actual_rx = w_Master_RX_Byte;
-      current_actual_rx = actual_rx;
-      test_in_progress = 1'b0;
-      
-      if (actual_rx == expected_rx) begin
-        $display("Test %0d: TX=0x%02X, RX=0x%02X - PASSED", test_count, tx_data, actual_rx);
-        pass_count = pass_count + 1;
-        test_passed = 1'b1;
-      end else begin
-        $display("Test %0d: TX=0x%02X, RX=0x%02X (Expected 0x%02X) - FAILED", 
-                test_count, tx_data, actual_rx, expected_rx);
-        fail_count = fail_count + 1;
-        test_passed = 1'b0;
-      end
-    end
-  endtask
-
-  // Main test sequence
-  initial begin
-    // Initialize signals
-    r_Master_TX_Byte = 8'h00;
-    r_Master_TX_DV = 1'b0;
+    // Instantiate the Unit Under Test (UUT)
+    SPI_master uut (
+        .iclk(iclk),
+        .cs(cs),
+        .sclk(sclk),
+        .mosi(mosi),
+        .miso(miso),
+        .acl_data(acl_data)
+    );
     
-    $display("=== SPI Master Test ===");
-    
-    // Reset sequence
-    r_Rst_L = 1'b0;
-    repeat(5) @(posedge r_Clk);
-    r_Rst_L = 1'b1;
-    repeat(3) @(posedge r_Clk);
-    
-    $display("Starting tests...");
-    
-    // Exhaustive test loop
-    for (i = 0; i < 8; i = i + 1) begin
-      repeat(3) @(posedge r_Clk);
-      SendAndVerify(test_tx_data[i], expected_rx_data[i]);
+    // Clock generation (4 MHz)
+    always begin
+        iclk = 0;
+        #125;
+        iclk = 1;
+        #125;
     end
     
-    // Edge case tests
-    $display("\nTesting edge cases:");
-    SendAndVerify(8'h00, 8'hB2);  // All zeros
-    SendAndVerify(8'hFF, 8'hB3);  // All ones
-    SendAndVerify(8'h55, 8'hB4);  // Alternating pattern 1
-    SendAndVerify(8'hAA, 8'hB5);  // Alternating pattern 2
+    // Function to extract expected 5-bit value from 16-bit input
+    function [4:0] extract_5bit;
+        input [15:0] data;
+        begin
+            extract_5bit = data[11:7];  // Bits [11:7] as per design
+        end
+    endfunction
     
-    // Back-to-back transmission test
-    $display("\nTesting back-to-back transmissions:");
-    for (i = 0; i < 4; i = i + 1) begin
-      SendAndVerify(8'h10 + i, 8'hB6 + i);
+    // MISO simulation - accelerometer response
+    always @(negedge sclk or posedge cs) begin
+        if (cs) begin
+            miso <= 1'b0;
+        end else begin
+            // During RECEIVE_DATA state (4'h9)
+            if (uut.state_reg == 4'h9) begin
+                case (uut.byte_counter)
+                    3'd0: miso <= x_data[uut.bit_counter];        // X LSB
+                    3'd1: miso <= x_data[8 + uut.bit_counter];    // X MSB
+                    3'd2: miso <= y_data[uut.bit_counter];        // Y LSB
+                    3'd3: miso <= y_data[8 + uut.bit_counter];    // Y MSB
+                    3'd4: miso <= z_data[uut.bit_counter];        // Z LSB
+                    3'd5: miso <= z_data[8 + uut.bit_counter];    // Z MSB
+                    default: miso <= 1'b0;
+                endcase
+            end else begin
+                miso <= 1'b0;
+            end
+        end
     end
     
-    repeat(10) @(posedge r_Clk);
+    // Enhanced test task with realistic accelerometer values
+    task run_orientation_test;
+        input signed [15:0] x_accel;  // X-axis 12-bit signed value in 16-bit format
+        input signed [15:0] y_accel;  // Y-axis 12-bit signed value in 16-bit format
+        input signed [15:0] z_accel;  // Z-axis 12-bit signed value in 16-bit format
+        input [8*80:1] test_description;
+        
+        reg [4:0] x_5bit;
+        reg [4:0] y_5bit;
+        reg [4:0] z_5bit;
+        reg [3:0] x_4bit;  // Actual 4-bit LED display value
+        reg [3:0] y_4bit;
+        reg [3:0] z_4bit;
+        reg [14:0] combined_15bit;
+        
+        begin
+            test_case = test_case + 1;
+            
+            $display("TEST %0d: %s", test_case, test_description);
+            
+           
+            
+        
+            
+            // Extract bits [11:7] (5 bits as acl_data stores them)
+            x_5bit = x_accel[11:7];
+            y_5bit = y_accel[11:7];
+            z_5bit = z_accel[11:7];
+            
+       
+            
+            $display("bits [11:7] from sensor:");
+            $display("  X [11:7]: 0b%05b ", x_5bit, x_5bit);
+            $display("  Y [11:7]: 0b%05b ", y_5bit, y_5bit);
+            $display("  Z [11:7]: 0b%05b ", z_5bit, z_5bit);
+            
+          
+            
+            // Combine into 15-bit orientation value (as stored internally)
+            combined_15bit = {x_5bit, y_5bit, z_5bit};
+            
+            $display("\nCOMBINED 15-BIT OUTPUT (acl_data[14:0]):");
+            $display("  Full value: 0b%015b (0x%04h)", combined_15bit, combined_15bit);
+            
+            // Set test data for simulation
+            x_data = x_accel;
+            y_data = y_accel;
+            z_data = z_accel;
+            
+            // Calculate expected results
+            expected_x = x_5bit;
+            expected_y = y_5bit;
+            expected_z = z_5bit;
+            expected_combined = combined_15bit;
+            
+            // Wait for data acquisition to complete
+            wait(uut.state_reg == 4'hA && uut.counter == 32'd258);  // END_SPI state
+            @(posedge iclk);
+            @(posedge iclk);
+            
+            // Verify results
+            $display("\n--- VERIFICATION ---");
+            $display("Component          Expected        Actual          Status");
+            $display("-------------------------------------------------------------");
+            $display("acl_data[14:0]     0x%04h          0x%04h          %s", 
+                    expected_combined, acl_data,
+                    (expected_combined === acl_data) ? "PASS" : "FAIL");
+            $display("X [14:10]          0b%05b         0b%05b         %s", 
+                    expected_x, acl_data[14:10],
+                    (expected_x === acl_data[14:10]) ? "PASS" : "FAIL");
+            $display("Y [9:5]            0b%05b         0b%05b         %s", 
+                    expected_y, acl_data[9:5],
+                    (expected_y === acl_data[9:5]) ? "PASS" : "FAIL");
+            $display("Z [4:0]            0b%05b         0b%05b         %s", 
+                    expected_z, acl_data[4:0],
+                    (expected_z === acl_data[4:0]) ? "PASS" : "FAIL");
+            
+       
+            
+            // Check overall test result
+            if ((expected_combined === acl_data) &&
+                (expected_x === acl_data[14:10]) &&
+                (expected_y === acl_data[9:5]) &&
+                (expected_z === acl_data[4:0])) begin
+                tests_passed = tests_passed + 1;
+                $display(" TEST RESULT: PASS ");
+            end else begin
+                tests_failed = tests_failed + 1;
+                $display(" TEST RESULT: FAIL");
+            end
+        end
+    endtask
     
-    // Results summary
-    $display("\n=== Test Results ===");
-    $display("Total Tests: %0d", test_count);
-    $display("Passed: %0d", pass_count);
-    $display("Failed: %0d", fail_count);
-    
-    if (fail_count == 0) begin
-      $display("ALL TESTS PASSED");
-    end else begin
-      $display("TESTS FAILED - %0d test(s) failed", fail_count);
+    // Main test sequence
+    initial begin
+        // Initialize
+        iclk = 0;
+        miso = 0;
+        tests_passed = 0;
+        tests_failed = 0;
+        
+        #100;
+        
+      //MISO STRESS TEST
+        
+        // Test Case 1: FLAT ON TABLE (0g, 0g, +1g)
+        run_orientation_test(
+            16'b0101010101010101,  // X = 0x5555
+            16'b0101010101010101,  // Y = 0x5555  
+            16'b0101010101010101,  // Z = 0x5555
+            "ALTERNATING BITS"
+        );
+        
+        // Test Case 2: FLAT ON TABLE (0g, 0g, +1g)        
+        run_orientation_test(
+            16'b1010101010101010,  // X = 0xAAAA
+            16'b1010101010101010,  // Y = 0xAAAA
+            16'b1010101010101010,  // Z = 0xAAAA
+            "INVERSE ALTERNATING"
+        );
+
+        // Test Case 3: FLAT ON TABLE (0g, 0g, +1g)        
+       run_orientation_test(
+            16'b0101010101010101,  // X = 0x5555
+            16'b1010101010101010,  // Y = 0xAAAA (inverse of X)
+            16'b0101010101010101,  // Z = 0x5555
+            "MIX ALTERNATION: X/Z = 0101, Y = 1010"
+        );
+        
+       //acl_data in
+        
+        // Test Case 4: FLAT ON TABLE 
+        run_orientation_test(
+            16'h0000, 
+            16'h0000, 
+            16'h0100,  
+            "FLAT ON TABLE (switches at bottom: X=0, Y=0, Z=8"
+        );
+        
+        // Test Case 5: TOP ROTATED 90° - X-AXIS DOWN 
+        run_orientation_test(
+            16'h00E0, 
+            16'h0000,  
+            16'h0000,
+            "TOP ROTATED 90 (X-axis down): X=7, Y=0, Z=0"
+        );
+        
+        // Test Case 6: SIDE ROTATED 90° - Y-AXIS DOWN (0g, +1g, 0g)
+        run_orientation_test(
+            16'h0000,  
+            16'h00E0, 
+            16'h0000,  
+            "SIDE ROTATED 90: X=0, Y=7, Z=0"
+        );
+        
+        // Final summary
+
+        $display("Total Tests:     %0d", (tests_passed + tests_failed));
+        $display("Tests Passed:    %0d", tests_passed);
+        $display("Tests Failed:    %0d", tests_failed);
+        
+      
+        #10000;
+        $finish;
     end
-    
-    $display("Simulation time: %0t ns", $time);
-    $finish;
-  end
 
 endmodule
