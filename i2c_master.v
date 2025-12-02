@@ -1,226 +1,237 @@
 module i2c_master #(
   parameter CLK_HZ = 100_000_000,
-  parameter I2C_HZ = 400_000  // Updated for MMC34160PJ fast mode
+  parameter I2C_HZ = 400_000
 )(
-  input  wire clk, rst,
-  input  wire start,                // start transaction
-  input  wire [6:0] dev_addr,       // 7-bit I2C address
-  input  wire [7:0] reg_addr,       // register address
-  input  wire rw,                   // 0=write, 1=read
-  input  wire [7:0] wr_data,        // data for write
-  input  wire [7:0] rd_len,         // number of bytes to read
-  output reg  rd_valid,
-  output reg  [7:0] rd_data,
-  input  wire rd_ready,
-  output reg  busy, done, nack_seen,
-  inout  wire sda, scl
+  input  wire clk,
+  input  wire rst,
+  
+  // Simple transaction interface
+  input  wire start,              // Start a transaction
+  input  wire [7:0] tx_data,      // Data to send (address or data byte)
+  input  wire tx_valid,           // tx_data is valid
+  output reg  tx_ready,           // Ready to accept tx_data
+  
+  output reg  [7:0] rx_data,      // Received data byte
+  output reg  rx_valid,           // rx_data is valid
+  
+  input  wire gen_start_cond,     // Generate START condition before next byte
+  input  wire gen_stop_cond,      // Generate STOP condition after current byte
+  input  wire read_mode,          // 1 = read byte from slave, 0 = write byte to slave
+  input  wire send_ack,           // When reading: 1 = send ACK, 0 = send NACK
+  
+  output reg  busy,               // Transaction in progress
+  output reg  nack_received,      // Slave sent NACK
+  
+  // I2C bus
+  inout  wire sda,
+  inout  wire scl
 );
 
-  // Clock divider (4 phases per I2C bit)
+  // Clock divider for I2C timing (4 phases per bit)
   localparam TPH = CLK_HZ / (I2C_HZ * 4);
   localparam TPH_W = $clog2(TPH);
-  reg [TPH_W-1:0] tcnt; reg [1:0] phase;
+  
+  reg [TPH_W-1:0] tcnt;
+  reg [1:0] phase;
   wire tick = (tcnt == 0);
-
-  always @(posedge clk)
-    if (rst) begin tcnt<=0; phase<=0; end
-    else if (tcnt==0) begin tcnt<=TPH-1; phase<=phase+1'b1; end
-    else tcnt<=tcnt-1'b1;
-
-  // Open-drain control
-  reg sda_drv0, scl_drv0;
-  assign sda = sda_drv0 ? 1'b0 : 1'bz;
-  assign scl = scl_drv0 ? 1'b0 : 1'bz;
-  wire sda_in = sda;
-
-  // Shifter + counters
-  reg [7:0] sh;
-  reg [2:0] bit_idx;
-  reg [7:0] bytes_left;
-
-  // Latched command
-  reg [6:0] a_dev; reg [7:0] a_reg, a_wdat, a_rlen; reg a_rw;
-
-  // FSM states
-  localparam
-    IDLE=0, START0=1, SAW0=2, SAW1=3,
-    REG0=4, REG1=5, WDAT0=6, WDAT1=7,
-    STOP0=8, STOP1=9, RSTA0=10, SAR0=11, SAR1=12,
-    RBIT=13, RACK=14, DONE_STATE=15;
-  reg [4:0] st;
-
-  // Main FSM
+  
   always @(posedge clk) begin
     if (rst) begin
-      st<=IDLE; busy<=0; done<=0; nack_seen<=0;
-      rd_valid<=0; rd_data<=0; sda_drv0<=0; scl_drv0<=0;
-      sh<=0; bit_idx<=7; bytes_left<=0;
+      tcnt <= 0;
+      phase <= 0;
+    end else if (tcnt == 0) begin
+      tcnt <= TPH - 1;
+      phase <= phase + 1'b1;
     end else begin
-      done<=0; rd_valid<=0;
+      tcnt <= tcnt - 1'b1;
+    end
+  end
 
-      case (st)
+  // Open-drain I2C outputs
+  reg sda_out, scl_out;
+  assign sda = sda_out ? 1'b0 : 1'bz;
+  assign scl = scl_out ? 1'b0 : 1'bz;
+  
+  // Read SDA with pullup behavior (high-Z = 1)
+  wire sda_in = (sda === 1'b0) ? 1'b0 : 1'b1;
+
+  // Shift register and bit counter
+  reg [7:0] shift_reg;
+  reg [2:0] bit_cnt;
+  
+  // Latched control signals
+  reg do_start, do_stop, is_read, ack_bit;
+  
+  // FSM states
+  localparam IDLE = 0;
+  localparam START = 1;
+  localparam TX_BIT = 2;
+  localparam TX_ACK = 3;
+  localparam RX_BIT = 4;
+  localparam RX_ACK = 5;
+  localparam STOP = 6;
+  
+  reg [2:0] state;
+
+  always @(posedge clk) begin
+    if (rst) begin
+      state <= IDLE;
+      busy <= 0;
+      tx_ready <= 1;
+      rx_valid <= 0;
+      nack_received <= 0;
+      sda_out <= 0;
+      scl_out <= 0;
+      shift_reg <= 0;
+      bit_cnt <= 0;
+      do_start <= 0;
+      do_stop <= 0;
+      is_read <= 0;
+      ack_bit <= 0;
+    end else begin
+      rx_valid <= 0;
+      
+      case (state)
         IDLE: begin
-          busy<=0; nack_seen<=0; sda_drv0<=0; scl_drv0<=0;
-          if (start) begin
-            a_dev<=dev_addr; a_reg<=reg_addr; a_wdat<=wr_data;
-            a_rlen<=rd_len; a_rw<=rw;
-            busy<=1; bit_idx<=7; st<=START0;
+          busy <= 0;
+          tx_ready <= 1;
+          sda_out <= 0;
+          scl_out <= 0;
+          
+          if (start && tx_valid) begin
+            shift_reg <= tx_data;
+            do_start <= gen_start_cond;
+            do_stop <= gen_stop_cond;
+            is_read <= read_mode;
+            ack_bit <= send_ack;
+            bit_cnt <= 7;
+            busy <= 1;
+            tx_ready <= 0;
+            
+            if (gen_start_cond) begin
+              state <= START;
+            end else if (read_mode) begin
+              state <= RX_BIT;
+            end else begin
+              state <= TX_BIT;
+            end
           end
         end
 
-        START0: if (tick&&phase==0) begin 
-                  sda_drv0<=0; scl_drv0<=0; // Both HIGH initially
-                end
-                else if (tick&&phase==1) begin
-                  sda_drv0<=1; // Pull SDA LOW while SCL HIGH (START condition)
-                end
-                else if (tick&&phase==2) begin
-                  scl_drv0<=1; // Pull SCL LOW
-                  sh<={a_dev,1'b0}; bit_idx<=7; st<=SAW0;
-                end
+        // Generate START condition: SDA falls while SCL is high
+        START: begin
+          if (tick && phase == 0) begin
+            sda_out <= 0;  // SDA = high
+            scl_out <= 0;  // SCL = high
+          end else if (tick && phase == 1) begin
+            sda_out <= 1;  // Pull SDA low (START)
+          end else if (tick && phase == 2) begin
+            scl_out <= 1;  // Pull SCL low
+          end else if (tick && phase == 3) begin
+            if (is_read) begin
+              state <= RX_BIT;
+              shift_reg <= 0;
+            end else begin
+              state <= TX_BIT;
+            end
+          end
+        end
 
-        SAW0: if (tick&&phase==0) begin
-                sda_drv0 <= ~sh[7]; scl_drv0 <= 1;  // Set data (inverted), SCL low
-              end
-              else if (tick&&phase==1) scl_drv0 <= 0;  // SCL high
-              else if (tick&&phase==3) begin
-                scl_drv0 <= 1;  // SCL low
-                sh<={sh[6:0],1'b0};
-                if (bit_idx==0) st<=SAW1; else bit_idx<=bit_idx-1;
-              end
+        // Transmit data bit
+        TX_BIT: begin
+          if (tick && phase == 0) begin
+            sda_out <= ~shift_reg[7];  // Set data bit (inverted for open-drain)
+            scl_out <= 1;              // SCL low
+          end else if (tick && phase == 1) begin
+            scl_out <= 0;              // SCL high
+          end else if (tick && phase == 3) begin
+            scl_out <= 1;              // SCL low
+            shift_reg <= {shift_reg[6:0], 1'b0};
+            
+            if (bit_cnt == 0) begin
+              state <= TX_ACK;
+            end else begin
+              bit_cnt <= bit_cnt - 1;
+            end
+          end
+        end
 
-        SAW1: if (tick&&phase==0) begin 
-                sda_drv0<=0; scl_drv0<=1;  // Release SDA for ACK, SCL low
-              end
-              else if (tick&&phase==1) scl_drv0 <= 0;  // SCL high
-              else if (tick&&phase==2) begin
-                if (sda_in) nack_seen<=1;
-              end
-              else if (tick&&phase==3) begin
-                scl_drv0 <= 1;  // SCL low
-                sh<=a_reg; bit_idx<=7; st<=REG0;
-              end
+        // Receive ACK/NACK from slave
+        TX_ACK: begin
+          if (tick && phase == 0) begin
+            sda_out <= 0;  // Release SDA
+            scl_out <= 1;  // SCL low
+          end else if (tick && phase == 1) begin
+            scl_out <= 0;  // SCL high
+          end else if (tick && phase == 2) begin
+            nack_received <= sda_in;  // Sample ACK/NACK
+          end else if (tick && phase == 3) begin
+            scl_out <= 1;  // SCL low
+            
+            if (do_stop) begin
+              state <= STOP;
+            end else begin
+              state <= IDLE;
+            end
+          end
+        end
 
-        REG0: if (tick&&phase==0) begin
-                sda_drv0 <= ~sh[7]; scl_drv0 <= 1;
-              end
-              else if (tick&&phase==1) scl_drv0 <= 0;
-              else if (tick&&phase==3) begin
-                scl_drv0 <= 1;
-                sh<={sh[6:0],1'b0};
-                if (bit_idx==0) st<=REG1; else bit_idx<=bit_idx-1;
-              end
+        // Receive data bit from slave
+        RX_BIT: begin
+          if (tick && phase == 0) begin
+            sda_out <= 0;  // Release SDA
+            scl_out <= 1;  // SCL low
+          end else if (tick && phase == 1) begin
+            scl_out <= 0;  // SCL high
+          end else if (tick && phase == 2) begin
+            shift_reg <= {shift_reg[6:0], sda_in};  // Sample data bit
+          end else if (tick && phase == 3) begin
+            scl_out <= 1;  // SCL low
+            
+            if (bit_cnt == 0) begin
+              state <= RX_ACK;
+            end else begin
+              bit_cnt <= bit_cnt - 1;
+            end
+          end
+        end
 
-        REG1: if (tick&&phase==0) begin 
-                sda_drv0<=0; scl_drv0<=1;
-              end
-              else if (tick&&phase==1) scl_drv0 <= 0;
-              else if (tick&&phase==2) begin
-                if (sda_in) nack_seen<=1;
-              end
-              else if (tick&&phase==3) begin
-                scl_drv0 <= 1;
-                if (a_rw==0) begin sh<=a_wdat; bit_idx<=7; st<=WDAT0; end
-                else st<=RSTA0;
-              end
+        // Send ACK/NACK to slave
+        RX_ACK: begin
+          if (tick && phase == 0) begin
+            sda_out <= ~ack_bit;  // ACK=0 (pull low), NACK=1 (release)
+            scl_out <= 1;         // SCL low
+          end else if (tick && phase == 1) begin
+            scl_out <= 0;  // SCL high
+          end else if (tick && phase == 2) begin
+            rx_data <= shift_reg;
+            rx_valid <= 1;
+          end else if (tick && phase == 3) begin
+            scl_out <= 1;  // SCL low
+            
+            if (do_stop) begin
+              state <= STOP;
+            end else begin
+              state <= IDLE;
+            end
+          end
+        end
 
-        WDAT0: if (tick&&phase==0) begin
-                 sda_drv0 <= ~sh[7]; scl_drv0 <= 1;
-               end
-               else if (tick&&phase==1) scl_drv0 <= 0;
-               else if (tick&&phase==3) begin
-                 scl_drv0 <= 1;
-                 sh<={sh[6:0],1'b0};
-                 if (bit_idx==0) st<=WDAT1; else bit_idx<=bit_idx-1;
-               end
+        // Generate STOP condition: SDA rises while SCL is high
+        STOP: begin
+          if (tick && phase == 0) begin
+            sda_out <= 1;  // SDA low
+            scl_out <= 1;  // SCL low
+          end else if (tick && phase == 1) begin
+            scl_out <= 0;  // SCL high
+          end else if (tick && phase == 2) begin
+            sda_out <= 0;  // SDA high (STOP)
+          end else if (tick && phase == 3) begin
+            state <= IDLE;
+          end
+        end
 
-        WDAT1: if (tick&&phase==0) begin 
-                 sda_drv0<=0; scl_drv0<=1;
-               end
-               else if (tick&&phase==1) scl_drv0 <= 0;
-               else if (tick&&phase==2) begin
-                 if (sda_in) nack_seen<=1;
-               end
-               else if (tick&&phase==3) begin
-                 scl_drv0 <= 1;
-                 st<=STOP0;
-               end
-
-        STOP0: if (tick&&phase==0) begin 
-                 sda_drv0<=1'b1; scl_drv0<=1;  // SDA low, SCL low
-               end
-               else if (tick&&phase==1) scl_drv0 <= 0;  // SCL high
-               else if (tick&&phase==2) sda_drv0<=0;  // SDA high (STOP)
-               else if (tick&&phase==3) st<=STOP1;
-
-        STOP1: begin done<=1; st<=DONE_STATE; end
-        DONE_STATE: st<=IDLE;
-
-        // -------- READ path --------
-        // repeated START: SDA goes low while SCL is high, then send SLA+R
-        RSTA0: if (tick && phase==2'd0) begin
-                 scl_drv0 <= 0;   // SCL HIGH
-                 sda_drv0 <= 0;   // SDA HIGH
-               end
-               else if (tick && phase==2'd1) begin
-                 sda_drv0 <= 1;   // Pull SDA LOW (START condition while SCL HIGH)
-               end
-               else if (tick && phase==2'd2) begin
-                 scl_drv0 <= 1;   // Pull SCL LOW
-               end
-               else if (tick && phase==2'd3) begin
-                 sh <= {a_dev,1'b1}; // SLA+R
-                 bit_idx <= 3'd7;
-                 st <= SAR0;
-               end
-
-        SAR0:  if (tick&&phase==0) begin
-                 sda_drv0 <= ~sh[7]; scl_drv0 <= 1;
-               end
-               else if (tick&&phase==1) scl_drv0 <= 0;
-               else if (tick&&phase==3) begin
-                 scl_drv0 <= 1;
-                 sh<={sh[6:0],1'b0};
-                 if (bit_idx==0) st<=SAR1; else bit_idx<=bit_idx-1;
-               end
-
-        SAR1:  if (tick&&phase==0) begin 
-                 sda_drv0<=0; scl_drv0<=1;
-               end
-               else if (tick&&phase==1) scl_drv0 <= 0;
-               else if (tick&&phase==2) begin
-                 if (sda_in) nack_seen<=1;
-                 bytes_left<= (a_rlen==0)?1:a_rlen;
-               end
-               else if (tick&&phase==3) begin
-                 scl_drv0 <= 1;
-                 bit_idx<=7; sh<=0; sda_drv0<=0; st<=RBIT;
-               end
-
-        RBIT:  if (tick&&phase==0) begin
-                 sda_drv0 <= 0; scl_drv0 <= 1;  // Release SDA, SCL low
-               end
-               else if (tick&&phase==1) scl_drv0 <= 0;  // SCL high
-               else if (tick&&phase==2) sh<={sh[6:0],sda_in};
-               else if (tick&&phase==3) begin
-                 scl_drv0 <= 1;  // SCL low
-                 if (bit_idx==0) st<=RACK; 
-                 else bit_idx<=bit_idx-1;
-               end
-
-        RACK:  if (tick&&phase==0) begin
-                 scl_drv0 <= 1;  // SCL low
-                 if (bytes_left>1) sda_drv0<=1; else sda_drv0<=0;  // ACK (pull low) if more bytes, NACK (release) if last
-               end
-               else if (tick&&phase==1) scl_drv0 <= 0;  // SCL high
-               else if (tick&&phase==2) begin
-                 rd_data<=sh; rd_valid<=1;
-               end
-               else if (tick&&phase==3) begin
-                 scl_drv0 <= 1;  // SCL low
-                 if (bytes_left==1) st<=STOP0;
-                 else begin bytes_left<=bytes_left-1; bit_idx<=7; sh<=0; st<=RBIT; end
-               end
+        default: state <= IDLE;
       endcase
     end
   end
