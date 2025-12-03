@@ -1,5 +1,8 @@
 `timescale 1ns / 1ps
-
+//==============================================================================
+// Magnetometer Driver for Pmod CMPS2 (MMC34160PJ)
+// Uses high-level i2c_master transaction interface
+//==============================================================================
 module magnetometer_driver #(
     parameter CLK_HZ = 100_000_000   // 100 MHz system clock
 )(
@@ -17,25 +20,31 @@ module magnetometer_driver #(
     output reg signed [15:0] mag_y,
     output reg signed [15:0] mag_z,
     
+    // Debug output - count rd_valid pulses
+    output reg [7:0] debug_byte,
+    
     // I2C bus
     inout  wire sda,
     inout  wire scl
 );
 
     //==========================================================================
-    // MMC34160PJ Constants
+    // Pmod CMPS2 (MMC34160PJ) Constants - Per Digilent Reference Manual
     //==========================================================================
-    localparam [6:0] I2C_ADDR = 7'h30;    // 7-bit I2C address
+    localparam [6:0] I2C_ADDR = 7'h30;    // 7-bit I2C address (0x60 >> 1)
     
-    // Register addresses
-    localparam [7:0] REG_XOUT_LSB = 8'h00;  // X axis output LSB
-    localparam [7:0] REG_CTRL0    = 8'h08;  // Internal Control 0
-    localparam [7:0] REG_CTRL1    = 8'h09;  // Internal Control 1
+    // Register addresses (from Digilent Pmod CMPS2 Reference Manual)
+    localparam [7:0] REG_XOUT_LSB   = 8'h00;  // X axis output LSB
+    localparam [7:0] REG_STATUS     = 8'h03;  // Status register
+    localparam [7:0] REG_CTRL0      = 8'h07;  // Internal Control Register 0 (NOT 0x08!)
+    localparam [7:0] REG_CTRL1      = 8'h08;  // Internal Control Register 1
+    localparam [7:0] REG_PRODUCT_ID = 8'h20;  // Product ID (should read 0x06)
     
-    // Control register bits
-    localparam [7:0] CTRL0_TM_M   = 8'h01;  // Take Measurement (magnetic)
-    localparam [7:0] CTRL1_SW_RST = 8'h80;  // Software reset
-    localparam [7:0] CTRL1_CM_FREQ_1HZ = 8'h01;  // Continuous mode 1Hz
+    // Control Register 0 commands (from Digilent Reference Manual)
+    localparam [7:0] CMD_REFILL_CAP = 8'h80;  // Refill capacitor (required before SET/RESET)
+    localparam [7:0] CMD_SET        = 8'h20;  // SET action (magnetize sensing resistors)
+    localparam [7:0] CMD_RESET      = 8'h40;  // RESET action (reverse magnetization)
+    localparam [7:0] CMD_TM_M       = 8'h01;  // Take Measurement (magnetic)
 
     //==========================================================================
     // I2C Master Interface
@@ -52,10 +61,11 @@ module magnetometer_driver #(
     wire        i2c_busy;
     wire        i2c_done;
     wire        i2c_error;
+    wire [3:0]  i2c_state;  // Debug: I2C FSM state
     
     i2c_master #(
         .CLK_HZ(CLK_HZ),
-        .I2C_HZ(400_000)
+        .I2C_HZ(100_000)   // Slow down to 100kHz for debugging
     ) i2c (
         .clk(clk),
         .rst(rst),
@@ -70,30 +80,60 @@ module magnetometer_driver #(
         .busy(i2c_busy),
         .done(i2c_done),
         .error(i2c_error),
+        .debug_state(i2c_state),
         .sda(sda),
         .scl(scl)
     );
 
     //==========================================================================
-    // FSM States
+    // FSM States - Following Digilent Pmod CMPS2 Reference Manual
     //==========================================================================
-    localparam [2:0]
-        S_IDLE        = 3'd0,
-        S_INIT_START  = 3'd1,   // Start initialization write
-        S_INIT_WAIT   = 3'd2,   // Wait for init to complete
-        S_TRIG_START  = 3'd3,   // Start trigger measurement write
-        S_TRIG_WAIT   = 3'd4,   // Wait for trigger to complete
-        S_READ_START  = 3'd5,   // Start 6-byte read
-        S_READ_WAIT   = 3'd6,   // Wait for read to complete
-        S_DONE        = 3'd7;
+    localparam [4:0]
+        S_IDLE           = 5'd0,
+        S_REFILL_CAP     = 5'd1,   // Write 0x80 to CTRL0 (refill capacitor)
+        S_REFILL_WAIT    = 5'd2,
+        S_REFILL_DELAY   = 5'd3,   // Wait 50ms for capacitor
+        S_SET_CMD        = 5'd4,   // Write 0x20 to CTRL0 (SET action)
+        S_SET_WAIT       = 5'd5,
+        S_SET_DELAY      = 5'd6,   // Wait 1ms after SET
+        S_TRIG_MEAS      = 5'd7,   // Write 0x01 to CTRL0 (take measurement)
+        S_TRIG_WAIT      = 5'd8,
+        S_MEAS_DELAY     = 5'd9,   // Wait 8ms for measurement
+        S_READ_START     = 5'd10,  // Read 6 bytes from 0x00
+        S_READ_WAIT      = 5'd11;
     
-    reg [2:0] state;
+    reg [4:0] state;
     reg [2:0] byte_cnt;
     reg [7:0] data_buf [0:5];   // 6 bytes: X_LSB, X_MSB, Y_LSB, Y_MSB, Z_LSB, Z_MSB
     reg       initialized;
+    reg [23:0] delay_cnt;       // Counter for delays (need up to 50ms = 5,000,000 cycles)
 
     //==========================================================================
-    // Capture incoming read bytes
+    // Debug: show byte 0 (X_LSB) or byte 1 (X_MSB) from last read
+    // We latch bytes 0 and 1 specifically for X-axis debug
+    //==========================================================================
+    reg [7:0] debug_x_lsb;
+    reg [7:0] debug_x_msb;
+    
+    always @(posedge clk) begin
+        if (rst) begin
+            debug_byte <= 0;
+            debug_x_lsb <= 0;
+            debug_x_msb <= 0;
+        end else if (i2c_rd_valid && state == S_READ_WAIT) begin
+            // Capture X-axis bytes specifically
+            if (byte_cnt == 0) debug_x_lsb <= i2c_rd_data;  // X_LSB
+            if (byte_cnt == 1) debug_x_msb <= i2c_rd_data;  // X_MSB
+            // Show current byte being received
+            debug_byte <= i2c_rd_data;
+        end else if (state == S_IDLE && !busy) begin
+            // When idle, show X_MSB (more likely to have non-zero bits)
+            debug_byte <= debug_x_msb;
+        end
+    end
+
+    //==========================================================================
+    // Capture incoming read bytes into data_buf
     //==========================================================================
     always @(posedge clk) begin
         if (rst) begin
@@ -107,7 +147,7 @@ module magnetometer_driver #(
     end
 
     //==========================================================================
-    // Main FSM
+    // Main FSM - Following Digilent Pmod CMPS2 Initialization Sequence
     //==========================================================================
     always @(posedge clk) begin
         if (rst) begin
@@ -125,61 +165,112 @@ module magnetometer_driver #(
             i2c_rw <= 0;
             i2c_num_bytes <= 1;
             i2c_wr_data <= 0;
+            delay_cnt <= 0;
         end else begin
-            // Default: clear pulses
             data_valid <= 0;
             i2c_start <= 0;
             
             case (state)
-                //--------------------------------------------------------------
+                //==============================================================
+                // IDLE: Wait for start_read pulse
+                //==============================================================
                 S_IDLE: begin
                     if (start_read) begin
                         busy <= 1;
                         error <= 0;
                         if (initialized) begin
-                            state <= S_TRIG_START;
+                            // Already initialized, just take a measurement
+                            state <= S_TRIG_MEAS;
                         end else begin
-                            state <= S_INIT_START;
+                            // First time: do full initialization sequence
+                            // Step 1: Refill capacitor (write 0x80 to CTRL0)
+                            state <= S_REFILL_CAP;
                         end
                     end else begin
                         busy <= 0;
                     end
                 end
                 
-                //--------------------------------------------------------------
-                // INIT: Write to CTRL1 to enable continuous mode
-                //--------------------------------------------------------------
-                S_INIT_START: begin
+                //==============================================================
+                // INIT STEP 1: Refill capacitor (write 0x80 to register 0x07)
+                //==============================================================
+                S_REFILL_CAP: begin
                     i2c_device_addr <= I2C_ADDR;
-                    i2c_reg_addr <= REG_CTRL1;
-                    i2c_rw <= 0;  // Write
+                    i2c_reg_addr <= REG_CTRL0;      // 0x07
+                    i2c_rw <= 0;                     // Write
                     i2c_num_bytes <= 1;
-                    i2c_wr_data <= CTRL1_CM_FREQ_1HZ;
+                    i2c_wr_data <= CMD_REFILL_CAP;  // 0x80
                     i2c_start <= 1;
-                    state <= S_INIT_WAIT;
+                    state <= S_REFILL_WAIT;
                 end
                 
-                S_INIT_WAIT: begin
+                S_REFILL_WAIT: begin
                     if (i2c_done) begin
                         if (i2c_error) begin
                             error <= 1;
+                            busy <= 0;
                             state <= S_IDLE;
                         end else begin
-                            initialized <= 1;
-                            state <= S_TRIG_START;
+                            delay_cnt <= 0;
+                            state <= S_REFILL_DELAY;
                         end
                     end
                 end
                 
-                //--------------------------------------------------------------
-                // TRIGGER: Write TM_M bit to CTRL0 to take measurement
-                //--------------------------------------------------------------
-                S_TRIG_START: begin
+                // Wait 50ms for capacitor to refill (50ms * 100MHz = 5,000,000 cycles)
+                S_REFILL_DELAY: begin
+                    if (delay_cnt >= 24'd5_000_000) begin
+                        state <= S_SET_CMD;
+                    end else begin
+                        delay_cnt <= delay_cnt + 1;
+                    end
+                end
+                
+                //==============================================================
+                // INIT STEP 2: SET action (write 0x20 to register 0x07)
+                //==============================================================
+                S_SET_CMD: begin
                     i2c_device_addr <= I2C_ADDR;
-                    i2c_reg_addr <= REG_CTRL0;
-                    i2c_rw <= 0;  // Write
+                    i2c_reg_addr <= REG_CTRL0;      // 0x07
+                    i2c_rw <= 0;                     // Write
                     i2c_num_bytes <= 1;
-                    i2c_wr_data <= CTRL0_TM_M;
+                    i2c_wr_data <= CMD_SET;         // 0x20
+                    i2c_start <= 1;
+                    state <= S_SET_WAIT;
+                end
+                
+                S_SET_WAIT: begin
+                    if (i2c_done) begin
+                        if (i2c_error) begin
+                            error <= 1;
+                            busy <= 0;
+                            state <= S_IDLE;
+                        end else begin
+                            delay_cnt <= 0;
+                            state <= S_SET_DELAY;
+                        end
+                    end
+                end
+                
+                // Wait 1ms after SET action (1ms * 100MHz = 100,000 cycles)
+                S_SET_DELAY: begin
+                    if (delay_cnt >= 24'd100_000) begin
+                        initialized <= 1;
+                        state <= S_TRIG_MEAS;
+                    end else begin
+                        delay_cnt <= delay_cnt + 1;
+                    end
+                end
+                
+                //==============================================================
+                // MEASUREMENT: Trigger measurement (write 0x01 to register 0x07)
+                //==============================================================
+                S_TRIG_MEAS: begin
+                    i2c_device_addr <= I2C_ADDR;
+                    i2c_reg_addr <= REG_CTRL0;      // 0x07
+                    i2c_rw <= 0;                     // Write
+                    i2c_num_bytes <= 1;
+                    i2c_wr_data <= CMD_TM_M;        // 0x01
                     i2c_start <= 1;
                     state <= S_TRIG_WAIT;
                 end
@@ -188,20 +279,31 @@ module magnetometer_driver #(
                     if (i2c_done) begin
                         if (i2c_error) begin
                             error <= 1;
+                            busy <= 0;
                             state <= S_IDLE;
                         end else begin
-                            state <= S_READ_START;
+                            delay_cnt <= 0;
+                            state <= S_MEAS_DELAY;
                         end
                     end
                 end
                 
-                //--------------------------------------------------------------
-                // READ: Read 6 bytes from REG_XOUT_LSB
-                //--------------------------------------------------------------
+                // Wait 8ms for measurement (8ms * 100MHz = 800,000 cycles)
+                S_MEAS_DELAY: begin
+                    if (delay_cnt >= 24'd800_000) begin
+                        state <= S_READ_START;
+                    end else begin
+                        delay_cnt <= delay_cnt + 1;
+                    end
+                end
+                
+                //==============================================================
+                // READ: Read 6 bytes starting from register 0x00
+                //==============================================================
                 S_READ_START: begin
                     i2c_device_addr <= I2C_ADDR;
-                    i2c_reg_addr <= REG_XOUT_LSB;
-                    i2c_rw <= 1;  // Read
+                    i2c_reg_addr <= REG_XOUT_LSB;   // 0x00
+                    i2c_rw <= 1;                     // Read
                     i2c_num_bytes <= 3'd6;
                     i2c_start <= 1;
                     state <= S_READ_WAIT;
@@ -211,26 +313,24 @@ module magnetometer_driver #(
                     if (i2c_done) begin
                         if (i2c_error) begin
                             error <= 1;
+                            busy <= 0;
                             state <= S_IDLE;
                         end else begin
-                            state <= S_DONE;
+                            // Assemble 16-bit values from LSB, MSB pairs
+                            mag_x <= {data_buf[1], data_buf[0]};  // X_MSB, X_LSB
+                            mag_y <= {data_buf[3], data_buf[2]};  // Y_MSB, Y_LSB
+                            mag_z <= {data_buf[5], data_buf[4]};  // Z_MSB, Z_LSB
+                            data_valid <= 1;
+                            busy <= 0;
+                            state <= S_IDLE;
                         end
                     end
                 end
                 
-                //--------------------------------------------------------------
-                // DONE: Assemble 16-bit values and signal completion
-                //--------------------------------------------------------------
-                S_DONE: begin
-                    // MMC34160PJ outputs LSB first: [LSB, MSB]
-                    mag_x <= {data_buf[1], data_buf[0]};  // X_MSB, X_LSB
-                    mag_y <= {data_buf[3], data_buf[2]};  // Y_MSB, Y_LSB
-                    mag_z <= {data_buf[5], data_buf[4]};  // Z_MSB, Z_LSB
-                    data_valid <= 1;
+                default: begin
                     state <= S_IDLE;
+                    busy <= 0;
                 end
-                
-                default: state <= S_IDLE;
             endcase
         end
     end
