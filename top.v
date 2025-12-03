@@ -16,7 +16,10 @@ module top(
     
     // Display outputs
     output reg [6:0] seg,
-    output reg [7:0] an
+    output reg [7:0] an,
+    
+    // Debug LEDs
+    output [15:0] LED
 );
 
     // ========== Clock Generation ==========
@@ -24,8 +27,11 @@ module top(
     reg [4:0] clk_div = 0;
     reg clk_4mhz = 0;
     
-    always @(posedge clk) begin
-        if (clk_div == 5'd12) begin  // 100MHz / 25 = 4MHz
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            clk_div <= 0;
+            clk_4mhz <= 0;
+        end else if (clk_div == 5'd12) begin  // 100MHz / 25 = 4MHz
             clk_div <= 0;
             clk_4mhz <= ~clk_4mhz;
         end else begin
@@ -33,10 +39,14 @@ module top(
         end
     end
 
-    // ========== Heading Calculation (includes Tilt Compensation, SPI, I2C) ==========
+    // ========== Heading Calculation (includes SPI, I2C sensor drivers) ==========
+    // Note: Tilt compensation disabled for stability - uses raw magnetometer data
     wire [8:0] heading;
-    wire signed [8:0] pitch, roll;
+    wire signed [8:0] pitch, roll;  // Always 0 (tilt comp disabled)
     wire heading_valid;
+    
+    wire mag_error, mag_busy;
+    wire [7:0] mag_x_debug;
     
     heading_calculation heading_inst (
         .clk(clk),
@@ -57,8 +67,41 @@ module top(
         .heading(heading),
         .pitch(pitch),
         .roll(roll),
-        .data_valid(heading_valid)
+        .data_valid(heading_valid),
+        .mag_error(mag_error),
+        .mag_busy(mag_busy),
+        .mag_x_debug(mag_x_debug)
     );
+
+    // ========== Debug LEDs ==========
+    // LED[0] = heading_valid pulse (should blink ~100Hz)
+    // LED[1] = clk_4mhz running (should appear always on)
+    // LED[2] = reset active
+    // LED[3] = SPI chip select active (low)
+    // LED[4] = SPI clock running
+    // LED[8:5] = heading[3:0] (lower 4 bits of heading)
+    // LED[15:9] = heading[8:4] (upper bits - top 2 always 0)
+    
+    // Stretch heading_valid pulse so it's visible
+    reg [23:0] valid_stretch = 0;
+    always @(posedge clk or posedge reset) begin
+        if (reset)
+            valid_stretch <= 0;
+        else if (heading_valid)
+            valid_stretch <= 24'hFFFFFF;
+        else if (valid_stretch > 0)
+            valid_stretch <= valid_stretch - 1;
+    end
+    
+    assign LED[0] = (valid_stretch > 0);   // Blinks when data updates
+    assign LED[1] = clk_4mhz;               // Should appear dim/on
+    assign LED[2] = reset;                  // ON if reset stuck high
+    assign LED[3] = ~ACL_CSN;               // ON when SPI active
+    assign LED[4] = ACL_SCLK;               // Flickers during SPI
+    assign LED[12:5] = mag_x_debug;         // Show raw magnetometer X data [7:0]
+    assign LED[13] = (mag_x_debug != 0);    // ON if mag_x has any non-zero data
+    assign LED[14] = mag_busy;              // ON when I2C transaction in progress
+    assign LED[15] = mag_error;             // ON if I2C NACK (magnetometer not responding)
 
     // ========== Display Heading on 7-Segment ==========
     // Convert heading (0-359) to BCD digits
