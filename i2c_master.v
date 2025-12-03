@@ -1,3 +1,10 @@
+`timescale 1ns / 1ps
+//==============================================================================
+// Simple High-Level I2C Master for Pmod CMPS2 (MMC34160PJ)
+// 
+// Clean, well-documented design optimized for easy verification.
+// Supports register read/write with multi-byte transfers.
+//==============================================================================
 module i2c_master #(
     parameter CLK_HZ = 100_000_000,
     parameter I2C_HZ = 400_000
@@ -19,10 +26,15 @@ module i2c_master #(
     output reg         done,
     output reg         error,           // NACK received
     
+    // Debug output
+    output wire [3:0]  debug_state,      // Current FSM state for debugging
+    
     // I2C bus
     inout  wire        sda,
     inout  wire        scl
 );
+
+    assign debug_state = state;
 
     //==========================================================================
     // Clock divider for I2C timing
@@ -34,9 +46,13 @@ module i2c_master #(
     reg [1:0] quarter;  // 0,1,2,3 within each bit period
     wire quarter_tick = (clk_div == 0);
     
+    // Use state instead of busy to control clock divider
+    // This avoids timing issues when busy transitions
+    wire running = (state != ST_IDLE);
+    
     always @(posedge clk) begin
-        if (rst || !busy) begin
-            clk_div <= CLKS_PER_QUARTER - 1;
+        if (rst || !running) begin
+            clk_div <= 0;  // Start at 0 so first tick happens immediately
             quarter <= 0;
         end else if (clk_div == 0) begin
             clk_div <= CLKS_PER_QUARTER - 1;
@@ -49,14 +65,14 @@ module i2c_master #(
     //==========================================================================
     // I2C open-drain signals
     //==========================================================================
-    reg sda_drive, scl_drive;  // Active LOW drivers (directly drive the signal)
+    reg sda_oe, scl_oe;  // Output enable (active high = drive low)
     
-    // Open-drain: drive low when drive=1, else release to high-Z (pulled high)
-    assign sda = sda_drive ? 1'b0 : 1'bz;
-    assign scl = scl_drive ? 1'b0 : 1'bz;
+    // Open-drain: drive low when oe=1, else release to high-Z (pulled high externally)
+    assign sda = sda_oe ? 1'b0 : 1'bz;
+    assign scl = scl_oe ? 1'b0 : 1'bz;
     
-    // Read SDA (treat high-Z as 1)
-    wire sda_sample = (sda === 1'b0) ? 1'b0 : 1'b1;
+    // Read SDA - just read the pin directly (pull-up ensures high when released)
+    wire sda_in = sda;
 
     //==========================================================================
     // State machine
@@ -96,8 +112,8 @@ module i2c_master #(
             error <= 0;
             rd_valid <= 0;
             rd_data <= 0;
-            sda_drive <= 0;
-            scl_drive <= 0;
+            sda_oe <= 0;
+            scl_oe <= 0;
             shift_out <= 0;
             shift_in <= 0;
             bit_cnt <= 0;
@@ -117,8 +133,8 @@ module i2c_master #(
                 //==============================================================
                 ST_IDLE: begin
                     busy <= 0;
-                    sda_drive <= 0;  // Release
-                    scl_drive <= 0;  // Release
+                    sda_oe <= 0;  // Release
+                    scl_oe <= 0;  // Release
                     
                     if (start) begin
                         busy <= 1;
@@ -137,9 +153,9 @@ module i2c_master #(
                 ST_START: begin
                     if (quarter_tick) begin
                         case (quarter)
-                            0: begin sda_drive <= 0; scl_drive <= 0; end  // Both high
-                            1: begin sda_drive <= 1; end                   // SDA low (START)
-                            2: begin scl_drive <= 1; end                   // SCL low
+                            0: begin sda_oe <= 0; scl_oe <= 0; end  // Both high
+                            1: begin sda_oe <= 1; end                   // SDA low (START)
+                            2: begin scl_oe <= 1; end                   // SCL low
                             3: begin
                                 // Prepare to send address + W
                                 shift_out <= {stored_addr, 1'b0};
@@ -151,28 +167,84 @@ module i2c_master #(
                 end
                 
                 //==============================================================
-                // Send a byte (used by ST_ADDR_W, ST_REG, ST_ADDR_R, ST_WRITE)
-                ST_ADDR_W, ST_REG, ST_ADDR_R, ST_WRITE: begin
+                // Send address + write bit
+                ST_ADDR_W: begin
                     if (quarter_tick) begin
                         case (quarter)
-                            0: begin
-                                // Set SDA based on MSB of shift register
-                                sda_drive <= ~shift_out[7];  // Invert: 1->drive low, 0->release
-                                scl_drive <= 1;              // Keep SCL low
-                            end
-                            1: begin
-                                scl_drive <= 0;  // SCL high - slave samples here
-                            end
-                            2: begin
-                                // Hold SCL high
-                            end
+                            0: begin sda_oe <= ~shift_out[7]; scl_oe <= 1; end
+                            1: begin scl_oe <= 0; end
+                            2: begin /* hold */ end
                             3: begin
-                                scl_drive <= 1;  // SCL low
+                                scl_oe <= 1;
                                 shift_out <= {shift_out[6:0], 1'b0};
-                                
                                 if (bit_cnt == 0) begin
-                                    // Byte complete, check ACK
-                                    next_state <= get_next_after_send(state);
+                                    next_state <= ST_REG;  // After addr+W, send register
+                                    state <= ST_ACK_CHECK;
+                                end else begin
+                                    bit_cnt <= bit_cnt - 1;
+                                end
+                            end
+                        endcase
+                    end
+                end
+                
+                //==============================================================
+                // Send register address
+                ST_REG: begin
+                    if (quarter_tick) begin
+                        case (quarter)
+                            0: begin sda_oe <= ~shift_out[7]; scl_oe <= 1; end
+                            1: begin scl_oe <= 0; end
+                            2: begin /* hold */ end
+                            3: begin
+                                scl_oe <= 1;
+                                shift_out <= {shift_out[6:0], 1'b0};
+                                if (bit_cnt == 0) begin
+                                    next_state <= is_read_op ? ST_RESTART : ST_WRITE;
+                                    state <= ST_ACK_CHECK;
+                                end else begin
+                                    bit_cnt <= bit_cnt - 1;
+                                end
+                            end
+                        endcase
+                    end
+                end
+                
+                //==============================================================
+                // Send address + read bit
+                ST_ADDR_R: begin
+                    if (quarter_tick) begin
+                        case (quarter)
+                            0: begin sda_oe <= ~shift_out[7]; scl_oe <= 1; end
+                            1: begin scl_oe <= 0; end
+                            2: begin /* hold */ end
+                            3: begin
+                                scl_oe <= 1;
+                                shift_out <= {shift_out[6:0], 1'b0};
+                                if (bit_cnt == 0) begin
+                                    next_state <= ST_READ;  // After addr+R, start reading
+                                    state <= ST_ACK_CHECK;
+                                end else begin
+                                    bit_cnt <= bit_cnt - 1;
+                                end
+                            end
+                        endcase
+                    end
+                end
+                
+                //==============================================================
+                // Write data byte
+                ST_WRITE: begin
+                    if (quarter_tick) begin
+                        case (quarter)
+                            0: begin sda_oe <= ~shift_out[7]; scl_oe <= 1; end
+                            1: begin scl_oe <= 0; end
+                            2: begin /* hold */ end
+                            3: begin
+                                scl_oe <= 1;
+                                shift_out <= {shift_out[6:0], 1'b0};
+                                if (bit_cnt == 0) begin
+                                    next_state <= (bytes_left <= 1) ? ST_STOP : ST_WRITE;
                                     state <= ST_ACK_CHECK;
                                 end else begin
                                     bit_cnt <= bit_cnt - 1;
@@ -188,19 +260,20 @@ module i2c_master #(
                     if (quarter_tick) begin
                         case (quarter)
                             0: begin
-                                sda_drive <= 0;  // Release SDA for slave ACK
-                                scl_drive <= 1;  // SCL low
+                                sda_oe <= 0;  // Release SDA for slave ACK
+                                scl_oe <= 1;  // SCL low
                             end
                             1: begin
-                                scl_drive <= 0;  // SCL high
+                                scl_oe <= 0;  // SCL high
                             end
                             2: begin
-                                ack_bit <= sda_sample;  // Sample ACK (0=ACK, 1=NACK)
+                                // Hold SCL high, sample will be in quarter 3
                             end
                             3: begin
-                                scl_drive <= 1;  // SCL low
+                                scl_oe <= 1;  // SCL low
                                 
-                                if (ack_bit) begin
+                                // Sample SDA NOW (while SCL just went low, data still valid)
+                                if (sda_in) begin
                                     // NACK - abort
                                     error <= 1;
                                     state <= ST_STOP;
@@ -214,6 +287,9 @@ module i2c_master #(
                                             shift_out <= stored_reg;
                                             bit_cnt <= 7;
                                         end
+                                        ST_RESTART: begin
+                                            // No setup needed
+                                        end
                                         ST_WRITE: begin
                                             shift_out <= stored_data;
                                             bit_cnt <= 7;
@@ -222,6 +298,9 @@ module i2c_master #(
                                         ST_READ: begin
                                             bit_cnt <= 7;
                                             shift_in <= 0;
+                                        end
+                                        ST_STOP: begin
+                                            // No setup needed
                                         end
                                         default: ;
                                     endcase
@@ -236,11 +315,11 @@ module i2c_master #(
                 ST_RESTART: begin
                     if (quarter_tick) begin
                         case (quarter)
-                            0: begin sda_drive <= 0; scl_drive <= 1; end  // SDA high, SCL low
-                            1: begin scl_drive <= 0; end                   // SCL high
-                            2: begin sda_drive <= 1; end                   // SDA low (START)
+                            0: begin sda_oe <= 0; scl_oe <= 1; end  // SDA high, SCL low
+                            1: begin scl_oe <= 0; end                   // SCL high
+                            2: begin sda_oe <= 1; end                   // SDA low (START)
                             3: begin
-                                scl_drive <= 1;  // SCL low
+                                scl_oe <= 1;  // SCL low
                                 shift_out <= {stored_addr, 1'b1};  // Address + R
                                 bit_cnt <= 7;
                                 state <= ST_ADDR_R;
@@ -255,22 +334,22 @@ module i2c_master #(
                     if (quarter_tick) begin
                         case (quarter)
                             0: begin
-                                sda_drive <= 0;  // Release SDA - slave drives
-                                scl_drive <= 1;  // SCL low
+                                sda_oe <= 0;  // Release SDA - slave drives
+                                scl_oe <= 1;  // SCL low
                             end
                             1: begin
-                                scl_drive <= 0;  // SCL high
+                                scl_oe <= 0;  // SCL high
                             end
                             2: begin
                                 // Sample SDA and shift into register
-                                shift_in <= {shift_in[6:0], sda_sample};
+                                shift_in <= {shift_in[6:0], sda_in};
                             end
                             3: begin
-                                scl_drive <= 1;  // SCL low
+                                scl_oe <= 1;  // SCL low
                                 
                                 if (bit_cnt == 0) begin
-                                    // Byte complete - shift_in already has all 8 bits from quarter 2
-                                    rd_data <= shift_in;
+                                    // Byte complete - use the UPDATED shift_in with last bit
+                                    rd_data <= {shift_in[6:0], sda_in};
                                     rd_valid <= 1;
                                     bytes_left <= bytes_left - 1;
                                     state <= ST_ACK_SEND;
@@ -289,17 +368,17 @@ module i2c_master #(
                         case (quarter)
                             0: begin
                                 // ACK=drive low (more data), NACK=release (last byte)
-                                sda_drive <= (bytes_left != 0) ? 1 : 0;
-                                scl_drive <= 1;
+                                sda_oe <= (bytes_left != 0) ? 1 : 0;
+                                scl_oe <= 1;
                             end
                             1: begin
-                                scl_drive <= 0;  // SCL high
+                                scl_oe <= 0;  // SCL high
                             end
                             2: begin
                                 // Hold
                             end
                             3: begin
-                                scl_drive <= 1;  // SCL low
+                                scl_oe <= 1;  // SCL low
                                 
                                 if (bytes_left == 0) begin
                                     state <= ST_STOP;
@@ -318,9 +397,9 @@ module i2c_master #(
                 ST_STOP: begin
                     if (quarter_tick) begin
                         case (quarter)
-                            0: begin sda_drive <= 1; scl_drive <= 1; end  // SDA low, SCL low
-                            1: begin scl_drive <= 0; end                   // SCL high
-                            2: begin sda_drive <= 0; end                   // SDA high (STOP)
+                            0: begin sda_oe <= 1; scl_oe <= 1; end  // SDA low, SCL low
+                            1: begin scl_oe <= 0; end                   // SCL high
+                            2: begin sda_oe <= 0; end                   // SDA high (STOP)
                             3: begin
                                 done <= 1;
                                 state <= ST_IDLE;
@@ -334,27 +413,4 @@ module i2c_master #(
         end
     end
     
-    //==========================================================================
-    // Helper function: determine next state after sending a byte
-    //==========================================================================
-    function [3:0] get_next_after_send;
-        input [3:0] current;
-        begin
-            case (current)
-                ST_ADDR_W: get_next_after_send = ST_REG;  // After addr+W, send register
-                ST_REG:    get_next_after_send = is_read_op ? ST_RESTART : ST_WRITE;
-                ST_ADDR_R: get_next_after_send = ST_READ; // After addr+R, start reading
-                ST_WRITE: begin
-                    // bytes_left was decremented when entering ST_WRITE
-                    // So 0 means no more bytes after this one
-                    if (bytes_left <= 1)
-                        get_next_after_send = ST_STOP;
-                    else
-                        get_next_after_send = ST_WRITE;  // More bytes
-                end
-                default:   get_next_after_send = ST_STOP;
-            endcase
-        end
-    endfunction
-
 endmodule
