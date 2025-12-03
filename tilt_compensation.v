@@ -3,12 +3,12 @@
 // CECS 361 Final Project - Digital Compass
 // Engineer: Nathan Sarkozy
 // 
-// Module: tilt_compensation
-// Description: Tilt compensation module with integrated sensor drivers.
-//              - Reads accelerometer via SPI (ADXL362)
+// Module: tilt_compensation (SIMPLIFIED - No Tilt Compensation)
+// Description: Sensor driver wrapper module.
+//              - Reads accelerometer via SPI (ADXL362) - for future use
 //              - Reads magnetometer via I2C (MMC34160PJ)
-//              - Applies tilt compensation to magnetometer readings
-//              - Outputs corrected X/Y magnetic field for heading calculation
+//              - Outputs raw magnetometer X/Y for heading calculation
+//              - Tilt compensation disabled for stability
 // 
 // Dependencies: SPI_master.v, magnetometer_driver.v
 //////////////////////////////////////////////////////////////////////////////////
@@ -30,20 +30,44 @@ module tilt_compensation (
     inout wire scl,
     
     // Test inputs (directly inject sensor data for simulation)
-    input wire [14:0] acl_data,           // Direct accelerometer data input
+    input wire [14:0] acl_data,           // Direct accelerometer data input (unused)
     input wire signed [15:0] mag_x,       // Direct magnetometer X input
     input wire signed [15:0] mag_y,       // Direct magnetometer Y input
     input wire signed [15:0] mag_z,       // Direct magnetometer Z input
     
     // Outputs
-    output reg signed [15:0] mag_x_comp,  // Tilt-compensated X
-    output reg signed [15:0] mag_y_comp,  // Tilt-compensated Y
-    output reg signed [8:0] pitch,        // Pitch angle (degrees)
-    output reg signed [8:0] roll,         // Roll angle (degrees)
-    output reg data_valid                 // New data ready flag
+    output wire signed [15:0] mag_x_comp, // Outputs raw magnetometer X (no tilt compensation)
+    output wire signed [15:0] mag_y_comp, // Outputs raw magnetometer Y (no tilt compensation)
+    output wire signed [15:0] mag_x_raw,  // Raw magnetometer X 
+    output wire signed [15:0] mag_y_raw,  // Raw magnetometer Y
+    output wire signed [8:0] pitch,       // Not computed (always 0)
+    output wire signed [8:0] roll,        // Not computed (always 0)
+    output reg data_valid,                // New data ready flag
+    
+    // Debug outputs
+    output wire mag_error_out,            // I2C error flag
+    output wire mag_busy_out,             // I2C busy flag
+    output wire [7:0] mag_x_debug         // I2C debug byte
 );
 
+    // ========== Debug Signal Routing ==========
+    assign mag_error_out = mag_error;
+    assign mag_busy_out = mag_busy;
+    assign mag_x_debug = i2c_debug_byte;
+    
+    // ========== Raw Magnetometer Outputs ==========
+    // Route raw signed magnetometer data directly to outputs
+    assign mag_x_raw = mag_x_signed;
+    assign mag_y_raw = mag_y_signed;
+    assign mag_x_comp = mag_x_signed;  // Same as raw (no tilt compensation)
+    assign mag_y_comp = mag_y_signed;  // Same as raw (no tilt compensation)
+    
+    // Pitch/Roll not computed (tilt compensation disabled)
+    assign pitch = 9'sd0;
+    assign roll = 9'sd0;
+
     // ========== SPI Accelerometer (ADXL362) ==========
+    // Kept for potential future use, but data not used for heading calculation
     wire [14:0] acl_data_spi;
     
     SPI_master spi_accel (
@@ -59,6 +83,7 @@ module tilt_compensation (
     wire signed [15:0] mag_x_i2c, mag_y_i2c, mag_z_i2c;
     wire mag_busy;
     wire mag_error;
+    wire [7:0] i2c_debug_byte;
     reg start_mag_read;
     reg [19:0] mag_timer;
     
@@ -74,18 +99,26 @@ module tilt_compensation (
         .mag_x(mag_x_i2c),
         .mag_y(mag_y_i2c),
         .mag_z(mag_z_i2c),
+        .debug_byte(i2c_debug_byte),
         .sda(sda),
         .scl(scl)
     );
     
     // ========== Sensor Data Selection ==========
-    // Use direct inputs if provided (non-zero), otherwise use hardware drivers
-    wire [14:0] acl_data_sel = (acl_data != 0) ? acl_data : acl_data_spi;
-    wire signed [15:0] mag_x_sel = (mag_x != 0 || mag_y != 0 || mag_z != 0) ? mag_x : mag_x_i2c;
-    wire signed [15:0] mag_y_sel = (mag_x != 0 || mag_y != 0 || mag_z != 0) ? mag_y : mag_y_i2c;
-    wire signed [15:0] mag_z_sel = (mag_x != 0 || mag_y != 0 || mag_z != 0) ? mag_z : mag_z_i2c;
+    // Use direct inputs if provided (non-zero), otherwise use hardware I2C driver
+    wire use_test_data = (mag_x != 0 || mag_y != 0 || mag_z != 0);
+    wire signed [15:0] mag_x_sel_raw = use_test_data ? mag_x : mag_x_i2c;
+    wire signed [15:0] mag_y_sel_raw = use_test_data ? mag_y : mag_y_i2c;
     
-    // Trigger magnetometer read every ~10ms
+    // ========== Magnetometer Unsigned to Signed Conversion ==========
+    // The MMC34160PJ outputs UNSIGNED 16-bit values where:
+    //   0 = -8 Gauss, 32768 = 0 Gauss, 65535 = +8 Gauss
+    // Convert to signed by flipping the MSB (offset binary to two's complement)
+    wire signed [15:0] mag_x_signed = {~mag_x_sel_raw[15], mag_x_sel_raw[14:0]};
+    wire signed [15:0] mag_y_signed = {~mag_y_sel_raw[15], mag_y_sel_raw[14:0]};
+    
+    // ========== Magnetometer Polling Timer ==========
+    // Trigger magnetometer read every ~10ms (1,000,000 cycles at 100MHz)
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             mag_timer <= 0;
@@ -102,164 +135,23 @@ module tilt_compensation (
         end
     end
 
-    // ========== Accelerometer Data Extraction ==========
-    // Sign-extend 5-bit values to 9-bit signed
-    wire signed [8:0] accel_x = {{4{acl_data_sel[14]}}, acl_data_sel[14:10]};
-    wire signed [8:0] accel_y = {{4{acl_data_sel[9]}}, acl_data_sel[9:5]};
-    wire signed [8:0] accel_z = {{4{acl_data_sel[4]}}, acl_data_sel[4:0]};
-
-    // ========== Tilt Compensation State Machine ==========
-    localparam IDLE      = 4'd0,
-               CALC_ANG  = 4'd1,
-               CALC_TRIG = 4'd2,
-               COMP_X1   = 4'd3,
-               COMP_X2   = 4'd4,
-               COMP_X3   = 4'd5,
-               COMP_Y1   = 4'd6,
-               COMP_Y2   = 4'd7,
-               COMP_Y3   = 4'd8,
-               COMP_Y4   = 4'd9,
-               COMP_Y5   = 4'd10,
-               COMP_Y6   = 4'd11,
-               DONE      = 4'd12;
+    // ========== Data Valid Generation ==========
+    // Generate data_valid pulse every ~10ms (40000 cycles at 4MHz)
+    reg [15:0] valid_counter;
     
-    reg [3:0] state;
-    reg [15:0] delay_counter;
-    
-    // Calculated angles
-    reg signed [8:0] pitch_calc;
-    reg signed [8:0] roll_calc;
-    
-    // Trig values (Q8.8 fixed point: 256 = 1.0)
-    reg signed [15:0] sin_pitch, cos_pitch;
-    reg signed [15:0] sin_roll, cos_roll;
-    
-    // Intermediate calculation registers
-    reg signed [31:0] temp_mult;
-    reg signed [15:0] x_term1, x_term2;
-    reg signed [15:0] y_term1, y_term2, y_term3;
-    
-    // Latched sensor values
-    reg signed [15:0] mag_x_reg, mag_y_reg, mag_z_reg;
-    reg signed [8:0] ax_reg, ay_reg, az_reg;
-    
-    // ========== Main Processing FSM ==========
     always @(posedge iclk or posedge reset) begin
         if (reset) begin
-            state <= IDLE;
-            delay_counter <= 0;
+            valid_counter <= 0;
             data_valid <= 0;
-            pitch <= 0;
-            roll <= 0;
-            mag_x_comp <= 0;
-            mag_y_comp <= 0;
         end else begin
-            case (state)
-                IDLE: begin
-                    data_valid <= 0;
-                    delay_counter <= delay_counter + 1;
-                    
-                    // Process every ~10ms (40000 cycles at 4MHz)
-                    if (delay_counter >= 16'd40000) begin
-                        delay_counter <= 0;
-                        // Latch sensor values (using selected source)
-                        mag_x_reg <= mag_x_sel;
-                        mag_y_reg <= mag_y_sel;
-                        mag_z_reg <= mag_z_sel;
-                        ax_reg <= accel_x;
-                        ay_reg <= accel_y;
-                        az_reg <= accel_z;
-                        state <= CALC_ANG;
-                    end
-                end
-                
-                // Calculate pitch and roll angles
-                CALC_ANG: begin
-                    if (az_reg != 0) begin
-                        // atan(x/z) ? (x/z) * 57.3° for small angles
-                        pitch_calc <= (ax_reg * 9'sd57) / az_reg;
-                        roll_calc <= (ay_reg * 9'sd57) / az_reg;
-                    end else begin
-                        // Handle vertical orientation
-                        pitch_calc <= (ax_reg > 0) ? 9'sd90 : -9'sd90;
-                        roll_calc <= (ay_reg > 0) ? 9'sd90 : -9'sd90;
-                    end
-                    state <= CALC_TRIG;
-                end
-                
-                // Calculate sin/cos using approximations
-                CALC_TRIG: begin
-                    pitch <= pitch_calc;
-                    roll <= roll_calc;
-                    
-                    // sin(?) ? ? * ?/180 * 256 = ? * 4.47
-                    sin_pitch <= (pitch_calc * 16'sd1144) >>> 8;
-                    sin_roll <= (roll_calc * 16'sd1144) >>> 8;
-                    
-                    // cos(?) ? 1 - ?²/2, scaled to Q8.8
-                    cos_pitch <= 16'sd256 - ((pitch_calc * pitch_calc) >>> 7);
-                    cos_roll <= 16'sd256 - ((roll_calc * roll_calc) >>> 7);
-                    
-                    state <= COMP_X1;
-                end
-                
-                // X compensation: X_comp = X*cos(pitch) + Z*sin(pitch)
-                COMP_X1: begin
-                    temp_mult <= mag_x_reg * cos_pitch;
-                    state <= COMP_X2;
-                end
-                
-                COMP_X2: begin
-                    x_term1 <= temp_mult[23:8];
-                    temp_mult <= mag_z_reg * sin_pitch;
-                    state <= COMP_X3;
-                end
-                
-                COMP_X3: begin
-                    mag_x_comp <= x_term1 + temp_mult[23:8];
-                    state <= COMP_Y1;
-                end
-                
-                // Y compensation: Y_comp = X*sin(roll)*sin(pitch) + Y*cos(roll) - Z*sin(roll)*cos(pitch)
-                COMP_Y1: begin
-                    temp_mult <= mag_x_reg * sin_roll;
-                    state <= COMP_Y2;
-                end
-                
-                COMP_Y2: begin
-                    temp_mult <= $signed(temp_mult[23:8]) * sin_pitch;
-                    state <= COMP_Y3;
-                end
-                
-                COMP_Y3: begin
-                    y_term1 <= temp_mult[23:8];
-                    temp_mult <= mag_y_reg * cos_roll;
-                    state <= COMP_Y4;
-                end
-                
-                COMP_Y4: begin
-                    y_term2 <= temp_mult[23:8];
-                    temp_mult <= mag_z_reg * sin_roll;
-                    state <= COMP_Y5;
-                end
-                
-                COMP_Y5: begin
-                    temp_mult <= $signed(temp_mult[23:8]) * cos_pitch;
-                    state <= COMP_Y6;
-                end
-                
-                COMP_Y6: begin
-                    mag_y_comp <= y_term1 + y_term2 - temp_mult[23:8];
-                    state <= DONE;
-                end
-                
-                DONE: begin
-                    data_valid <= 1;
-                    state <= IDLE;
-                end
-                
-                default: state <= IDLE;
-            endcase
+            data_valid <= 0;
+            valid_counter <= valid_counter + 1;
+            
+            // Pulse data_valid every ~10ms
+            if (valid_counter >= 16'd40000) begin
+                valid_counter <= 0;
+                data_valid <= 1;
+            end
         end
     end
 
