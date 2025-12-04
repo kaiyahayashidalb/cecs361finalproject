@@ -251,8 +251,8 @@ module top_tb;
             
             if (diff <= tolerance) begin
                 tests_passed = tests_passed + 1;
-                $display("[PASS] Test %0d: %s  Heading=%0d° (expected=%0d)", 
-                         test_num, dir_name, actual, expected);
+                $display("[PASS] Test %0d: %s  Heading=%0d° (expected=%0d°±%0d°)", 
+                         test_num, dir_name, actual, expected, tolerance);
             end else begin
                 tests_failed = tests_failed + 1;
                 $display("[FAIL] Test %0d: %s  Heading=%0d° (expected=%0d°±%0d°) [sim_mag: x=%0d y=%0d] [raw: x=%0d y=%0d]", 
