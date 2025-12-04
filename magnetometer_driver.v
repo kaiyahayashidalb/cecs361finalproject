@@ -4,7 +4,8 @@
 // Uses high-level i2c_master transaction interface
 //==============================================================================
 module magnetometer_driver #(
-    parameter CLK_HZ = 100_000_000   // 100 MHz system clock
+    parameter CLK_HZ = 100_000_000,  // 100 MHz system clock
+    parameter SIM_MODE = 0           // 1 = reduce delays for simulation
 )(
     input  wire clk,
     input  wire rst,
@@ -61,15 +62,14 @@ module magnetometer_driver #(
     wire        i2c_busy;
     wire        i2c_done;
     wire        i2c_error;
-    wire [3:0]  i2c_state;  // Debug: I2C FSM state
     
     i2c_master #(
         .CLK_HZ(CLK_HZ),
-        .I2C_HZ(100_000)   // Slow down to 100kHz for debugging
+        .I2C_HZ(100_000)   // 100kHz I2C
     ) i2c (
         .clk(clk),
         .rst(rst),
-        .start(i2c_start),
+        .start_txn(i2c_start),
         .device_addr(i2c_device_addr),
         .reg_addr(i2c_reg_addr),
         .rw(i2c_rw),
@@ -80,7 +80,7 @@ module magnetometer_driver #(
         .busy(i2c_busy),
         .done(i2c_done),
         .error(i2c_error),
-        .debug_state(i2c_state),
+        .start_cal(1'b0),
         .sda(sda),
         .scl(scl)
     );
@@ -218,8 +218,9 @@ module magnetometer_driver #(
                 end
                 
                 // Wait 50ms for capacitor to refill (50ms * 100MHz = 5,000,000 cycles)
+                // In SIM_MODE, reduce to 100 cycles
                 S_REFILL_DELAY: begin
-                    if (delay_cnt >= 24'd5_000_000) begin
+                    if (delay_cnt >= (SIM_MODE ? 24'd100 : 24'd5_000_000)) begin
                         state <= S_SET_CMD;
                     end else begin
                         delay_cnt <= delay_cnt + 1;
@@ -253,8 +254,9 @@ module magnetometer_driver #(
                 end
                 
                 // Wait 1ms after SET action (1ms * 100MHz = 100,000 cycles)
+                // In SIM_MODE, reduce to 100 cycles
                 S_SET_DELAY: begin
-                    if (delay_cnt >= 24'd100_000) begin
+                    if (delay_cnt >= (SIM_MODE ? 24'd100 : 24'd100_000)) begin
                         initialized <= 1;
                         state <= S_TRIG_MEAS;
                     end else begin
@@ -289,8 +291,9 @@ module magnetometer_driver #(
                 end
                 
                 // Wait 8ms for measurement (8ms * 100MHz = 800,000 cycles)
+                // In SIM_MODE, reduce to 100 cycles
                 S_MEAS_DELAY: begin
-                    if (delay_cnt >= 24'd800_000) begin
+                    if (delay_cnt >= (SIM_MODE ? 24'd100 : 24'd800_000)) begin
                         state <= S_READ_START;
                     end else begin
                         delay_cnt <= delay_cnt + 1;
