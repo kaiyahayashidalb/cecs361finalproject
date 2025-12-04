@@ -55,17 +55,15 @@ module heading_calculation (
     // Debug outputs
     output wire mag_error,                 // I2C error flag
     output wire mag_busy,                  // I2C busy flag
-    output wire [7:0] mag_x_debug          // Raw mag X for debug
+    output wire [7:0] mag_x_debug,         // Raw mag X for debug
+    output wire signed [15:0] mag_x_raw,   // NEW: Full raw X value
+    output wire signed [15:0] mag_y_raw    // NEW: Full raw Y value
 );
 
     // ========== Sensor Driver Instance (includes SPI & I2C drivers) ==========
     wire signed [15:0] mag_x_comp;         // Raw mag X (tilt comp disabled)
     wire signed [15:0] mag_y_comp;         // Raw mag Y (tilt comp disabled)
     wire tilt_data_valid;                  // Data ready flag
-    
-    // Raw magnetometer data (same as comp when tilt compensation disabled)
-    wire signed [15:0] mag_x_raw;
-    wire signed [15:0] mag_y_raw;
     
     tilt_compensation tilt_inst (
         .clk(clk),
@@ -95,18 +93,25 @@ module heading_calculation (
         .mag_x_debug(mag_x_debug)
     );
 
-    // ========== Quadrant Detection ==========
-    // Using raw magnetometer data for stable heading when board is held level.
-    // Tilt compensation was disabled due to accelerometer noise causing
-    // heading drift even when stationary.
+    // ========== 16-DIRECTION COMPASS CALCULATION ==========
+    // Maps magnetometer readings to 16 directions (22.5° resolution)
+    // N=0°, NNE=22.5°, NE=45°, ENE=67.5°, E=90°, ESE=112.5°, SE=135°, SSE=157.5°,
+    // S=180°, SSW=202.5°, SW=225°, WSW=247.5°, W=270°, WNW=292.5°, NW=315°, NNW=337.5°
     
-    // Use raw magnetometer data for heading calculation
-    wire signed [15:0] mag_x_use = mag_x_raw;
-    wire signed [15:0] mag_y_use = mag_y_raw;
+    // AXIS CORRECTION: Your sensor is rotated 225° (or -135°) from standard
+    wire signed [16:0] mag_x_extended = {mag_x_raw[15], mag_x_raw};
+    wire signed [16:0] mag_y_extended = {mag_y_raw[15], mag_y_raw};
     
-    // Deadband to reduce noise near zero
-    localparam signed [15:0] DEADBAND = 16'sd50;
+    wire signed [16:0] mag_x_rotated = mag_y_extended - mag_x_extended;  // Y - X
+    wire signed [16:0] mag_y_rotated = -(mag_x_extended + mag_y_extended); // -(X + Y)
     
+    wire signed [15:0] mag_x_use = mag_x_rotated[15:0];
+    wire signed [15:0] mag_y_use = mag_y_rotated[15:0];
+    
+    // Deadband threshold
+    localparam signed [15:0] DEADBAND = 16'sd10;
+    
+    // Sign detection
     wire x_pos = (mag_x_use > DEADBAND);
     wire x_neg = (mag_x_use < -DEADBAND);
     wire y_pos = (mag_y_use > DEADBAND);
@@ -114,107 +119,123 @@ module heading_calculation (
     wire x_zero = !x_pos && !x_neg;
     wire y_zero = !y_pos && !y_neg;
     
-    // Absolute values for ratio calculation
+    // Absolute values
     wire [15:0] abs_x = mag_x_use[15] ? (-mag_x_use) : mag_x_use;
     wire [15:0] abs_y = mag_y_use[15] ? (-mag_y_use) : mag_y_use;
     
-    // ========== Atan2 Approximation ==========
-    // Returns angle within quadrant (0-90 degrees)
-    // Using more comparison points for better accuracy
-    reg [6:0] base_angle;
+    // ========== 16-SECTOR DETERMINATION ==========
+    // Divide compass into 16 equal sectors of 22.5° each
+    // Sector boundaries at: 11.25°, 33.75°, 56.25°, 78.75° (and equivalents in other quadrants)
+    //
+    // For equal sectors, we need: tan(11.25°) ≈ 0.199, tan(33.75°) ≈ 0.668, tan(56.25°) ≈ 1.496, tan(78.75°) ≈ 5.027
+    //
+    // Using bit-shifts for hardware efficiency:
+    // tan(11.25°) ≈ 0.199 ≈ 51/256 ≈ X>>2 - X>>4 (0.1875, close enough)
+    // tan(33.75°) ≈ 0.668 ≈ 171/256 ≈ 2/3
+    // tan(56.25°) ≈ 1.496 ≈ 3/2
+    // tan(78.75°) ≈ 5.027 ≈ 5
     
-    // Precompute shifted values to avoid repeated shifting
-    wire [15:0] abs_x_div2 = abs_x >> 1;    // abs_x * 0.5
-    wire [15:0] abs_x_div4 = abs_x >> 2;    // abs_x * 0.25
-    wire [15:0] abs_x_div8 = abs_x >> 3;    // abs_x * 0.125
-    wire [15:0] abs_y_div2 = abs_y >> 1;    // abs_y * 0.5
-    wire [15:0] abs_y_div4 = abs_y >> 2;    // abs_y * 0.25
-    wire [15:0] abs_y_div8 = abs_y >> 3;    // abs_y * 0.125
+    wire [16:0] abs_x_17 = {1'b0, abs_x};
+    wire [16:0] abs_y_17 = {1'b0, abs_y};
     
-    // Calculate base angle from ratio |Y|/|X| or |X|/|Y|
-    // atan(0.125) ≈ 7°, atan(0.25) ≈ 14°, atan(0.5) ≈ 27°, atan(0.75) ≈ 37°, atan(1) = 45°
-    always @(*) begin
-        if (abs_x == 0 && abs_y == 0) begin
-            base_angle = 7'd0;
-        end else if (abs_x >= abs_y) begin
-            // |Y|/|X| <= 1, angle is 0-45 degrees
-            // Compare Y against fractions of X
-            if (abs_y == 0)
-                base_angle = 7'd0;
-            else if (abs_y < abs_x_div8)           // Y/X < 0.125 → ~4°
-                base_angle = 7'd4;
-            else if (abs_y < abs_x_div4)           // Y/X < 0.25 → ~11°
-                base_angle = 7'd11;
-            else if (abs_y < abs_x_div2)           // Y/X < 0.5 → ~22°
-                base_angle = 7'd22;
-            else if (abs_y < abs_x - abs_x_div4)   // Y/X < 0.75 → ~34°
-                base_angle = 7'd34;
-            else if (abs_y < abs_x)                // Y/X < 1.0 → ~42°
-                base_angle = 7'd42;
-            else
-                base_angle = 7'd45;                // Y/X = 1.0 → 45°
-        end else begin
-            // |Y|/|X| > 1, angle is 45-90 degrees
-            // Compare X against fractions of Y
-            if (abs_x == 0)
-                base_angle = 7'd90;
-            else if (abs_x < abs_y_div8)           // X/Y < 0.125 → ~86°
-                base_angle = 7'd86;
-            else if (abs_x < abs_y_div4)           // X/Y < 0.25 → ~79°
-                base_angle = 7'd79;
-            else if (abs_x < abs_y_div2)           // X/Y < 0.5 → ~68°
-                base_angle = 7'd68;
-            else if (abs_x < abs_y - abs_y_div4)   // X/Y < 0.75 → ~56°
-                base_angle = 7'd56;
-            else if (abs_x < abs_y)                // X/Y < 1.0 → ~48°
-                base_angle = 7'd48;
-            else
-                base_angle = 7'd45;                // X/Y = 1.0 → 45°
-        end
-    end
+    // Precise sector boundaries for equal 22.5° sectors
+    // Boundary 1: 11.25° → tan = 0.199 ≈ 1/5
+    wire [17:0] boundary1_x = {abs_x_17, 1'b0} + (abs_x_17 << 1);  // 5X for comparison
+    wire sector1 = (abs_y_17 * 5'd5) < boundary1_x;                 // Y/X < 0.2 (±11.25°)
     
-    // ========== Heading Calculation ==========
-    // Compass heading convention:
-    //   0° = North (+X direction)
-    //   90° = East (+Y direction)
-    //   180° = South (-X direction)
-    //   270° = West (-Y direction)
+    // Boundary 2: 33.75° → tan = 0.668 ≈ 2/3
+    wire [17:0] boundary2_x = abs_x_17 + (abs_x_17 >> 1);          // 1.5X
+    wire sector2 = (abs_y_17 + (abs_y_17 >> 1)) < boundary2_x;     // Y*1.5 < X*1.5 → Y < X*2/3
+    
+    // Boundary 3: 56.25° → tan = 1.496 ≈ 3/2
+    wire [17:0] boundary3_y = abs_y_17 + (abs_y_17 >> 1);          // 1.5Y
+    wire sector3 = abs_x_17 < boundary3_y;                          // X < 1.5Y → Y/X > 2/3
+    
+    // Boundary 4: 78.75° → tan = 5.027 ≈ 5
+    wire [18:0] boundary4_y = (abs_y_17 << 2) + abs_y_17;          // 5Y
+    wire sector4 = abs_x_17 < boundary4_y;                          // X < 5Y → Y/X > 1/5
+    
+    // ========== 16-DIRECTION HEADING CALCULATION ==========
+    // Each sector covers exactly 22.5° (360°/16)
+    // Sectors centered at: 0°, 22.5°, 45°, 67.5°, 90°, 112.5°, 135°, 157.5°, 180°, 202.5°, 225°, 247.5°, 270°, 292.5°, 315°, 337.5°
+    // Boundaries at: ±11.25° from center
+    
     reg [8:0] heading_calc;
     
     always @(*) begin
         if (x_zero && y_zero) begin
-            heading_calc = 9'd0;
-        end else if (x_pos && y_zero) begin
-            // Pure North
-            heading_calc = 9'd0;
-        end else if (x_zero && y_pos) begin
-            // Pure East
-            heading_calc = 9'd90;
-        end else if (x_neg && y_zero) begin
-            // Pure South
-            heading_calc = 9'd180;
-        end else if (x_zero && y_neg) begin
-            // Pure West
-            heading_calc = 9'd270;
-        end else if (x_pos && y_pos) begin
-            // Quadrant 1: 0-90� (NE)
-            heading_calc = {2'b00, base_angle};
-        end else if (x_neg && y_pos) begin
-            // Quadrant 2: 90-180� (SE)
-            heading_calc = 9'd180 - {2'b00, base_angle};
-        end else if (x_neg && y_neg) begin
-            // Quadrant 3: 180-270� (SW)
-            heading_calc = 9'd180 + {2'b00, base_angle};
-        end else begin
-            // Quadrant 4: 270-360� (NW)
-            heading_calc = 9'd360 - {2'b00, base_angle};
+            heading_calc = 9'd0;  // No signal
         end
+        // ===== QUADRANT 1: X+, Y+ (348.75° to 90°) =====
+        else if (x_pos && y_pos) begin
+            if (sector1)
+                heading_calc = 9'd0;      // N (348.75° to 11.25°)
+            else if (sector2)
+                heading_calc = 9'd23;     // NNE (11.25° to 33.75°)
+            else if (sector3)
+                heading_calc = 9'd45;     // NE (33.75° to 56.25°)
+            else if (sector4)
+                heading_calc = 9'd68;     // ENE (56.25° to 78.75°)
+            else
+                heading_calc = 9'd90;     // E (78.75° to 101.25°)
+        end
+        // ===== QUADRANT 2: X-, Y+ (78.75° to 180°) =====
+        else if (x_neg && y_pos) begin
+            if (sector4)
+                heading_calc = 9'd90;     // E (78.75° to 101.25°)
+            else if (sector3)
+                heading_calc = 9'd113;    // ESE (101.25° to 123.75°)
+            else if (sector2)
+                heading_calc = 9'd135;    // SE (123.75° to 146.25°)
+            else if (sector1)
+                heading_calc = 9'd158;    // SSE (146.25° to 168.75°)
+            else
+                heading_calc = 9'd180;    // S (168.75° to 191.25°)
+        end
+        // ===== QUADRANT 3: X-, Y- (168.75° to 270°) =====
+        else if (x_neg && y_neg) begin
+            if (sector1)
+                heading_calc = 9'd180;    // S (168.75° to 191.25°)
+            else if (sector2)
+                heading_calc = 9'd203;    // SSW (191.25° to 213.75°)
+            else if (sector3)
+                heading_calc = 9'd225;    // SW (213.75° to 236.25°)
+            else if (sector4)
+                heading_calc = 9'd248;    // WSW (236.25° to 258.75°)
+            else
+                heading_calc = 9'd270;    // W (258.75° to 281.25°)
+        end
+        // ===== QUADRANT 4: X+, Y- (258.75° to 360°) =====
+        else if (x_pos && y_neg) begin
+            if (sector4)
+                heading_calc = 9'd270;    // W (258.75° to 281.25°)
+            else if (sector3)
+                heading_calc = 9'd293;    // WNW (281.25° to 303.75°)
+            else if (sector2)
+                heading_calc = 9'd315;    // NW (303.75° to 326.25°)
+            else if (sector1)
+                heading_calc = 9'd338;    // NNW (326.25° to 348.75°)
+            else
+                heading_calc = 9'd0;      // N (348.75° to 11.25°)
+        end
+        // ===== PURE AXES =====
+        else if (x_pos)
+            heading_calc = 9'd0;          // N
+        else if (x_neg)
+            heading_calc = 9'd180;        // S
+        else if (y_pos)
+            heading_calc = 9'd90;         // E
+        else if (y_neg)
+            heading_calc = 9'd270;        // W
+        else
+            heading_calc = 9'd0;          // Default
     end
     
     // ========== Register Output with Calibration Offset ==========
-    // Calibration: Board reads 222° when pointing North, so add 138° offset
-    // (360° - 222° = 138°) to align with true North
-    localparam [8:0] HEADING_OFFSET = 9'd138;
+    // TEMPORARY: Offset disabled for debugging - set to 0
+    // Original offset was 138° - you need to calibrate for YOUR board
+    // To calibrate: Point board North, note the reading, then set offset = 360 - reading
+    localparam [8:0] HEADING_OFFSET = 9'd0;  // Changed from 138 to 0 for debugging
     wire [9:0] adjusted_heading = {1'b0, heading_calc} + {1'b0, HEADING_OFFSET};
     wire [8:0] normalized_heading = (adjusted_heading >= 10'd360) ? 
                                     (adjusted_heading[8:0] - 9'd360) : adjusted_heading[8:0];
@@ -223,7 +244,7 @@ module heading_calculation (
     reg [6:0] update_count;
     localparam [6:0] UPDATE_INTERVAL = 7'd64;  // Update every 64 samples (~640ms)
     
-    always @(posedge iclk or posedge reset) begin
+    always @(posedge clk or posedge reset) begin
         if (reset) begin
             heading <= 9'd0;
             update_count <= 0;
