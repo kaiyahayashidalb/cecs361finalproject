@@ -1,243 +1,257 @@
 `timescale 1ns / 1ps
-//////////////////////////////////////////////////////////////////////////////////
-// CECS 361 Final Project - Digital Compass
-// 
-// Module: heading_calculation
-// Description: Compass heading calculation module that:
-//              1. Instantiates tilt_compensation (sensor driver wrapper)
-//              2. Calculates compass heading from raw magnetometer X/Y data
-//              3. Uses quadrant-aware atan2 approximation for heading
-//              4. Applies 138° calibration offset to align with true North
-//              5. Updates display every 64 samples (~640ms) for stability
-// 
-// Inputs: 
-//   - clk: 100 MHz system clock
-//   - iclk: 4 MHz clock for SPI
-//   - reset: Active high reset
-//   - SPI pins: miso, sclk, mosi, cs (accelerometer - hardware present, not used)
-//   - I2C pins: sda, scl (magnetometer - Pmod CMPS2)
-//
-// Outputs:
-//   - heading: Compass heading in degrees (0-359, where 0=North, 90=East)
-//   - pitch, roll: Always 0 (tilt compensation disabled for stability)
-//   - data_valid: Pulse indicating new heading is ready
-//
-//////////////////////////////////////////////////////////////////////////////////
 
-module heading_calculation (
-    // Clock and reset
-    input wire clk,                        // 100 MHz system clock
-    input wire iclk,                       // 4 MHz clock for SPI
-    input wire reset,                      // Active high reset
+module magnetometer_driver #(
+    parameter CLK_HZ = 100_000_000   // 100 MHz system clock
+)(
+    input  wire clk,
+    input  wire rst,
     
-    // SPI interface (accelerometer)
-    input wire miso,
-    output wire sclk,
-    output wire mosi,
-    output wire cs,
+    // Control interface
+    input  wire start_read,          // Pulse high to start a magnetometer reading
+    input  wire start_calibrate,     // Pulse high to start calibration sequence
+    output reg  data_valid,          // High for one cycle when new data is ready
+    output reg  calibration_done,    // High for one cycle when calibration complete
+    output reg  busy,                // High while operation in progress
+    output reg  error,               // High if NACK received
     
-    // I2C interface (magnetometer)
-    inout wire sda,
-    inout wire scl,
+    // Magnetometer data outputs (16-bit signed, calibrated)
+    output reg signed [15:0] mag_x,
+    output reg signed [15:0] mag_y,
+    output reg signed [15:0] mag_z,
     
-    // Test inputs (directly inject sensor data for simulation)
-    input wire [14:0] acl_data,            // Direct accelerometer data input
-    input wire signed [15:0] mag_x,        // Direct magnetometer X input
-    input wire signed [15:0] mag_y,        // Direct magnetometer Y input
-    input wire signed [15:0] mag_z,        // Direct magnetometer Z input
-    
-    // Outputs
-    output reg [8:0] heading,              // Heading in degrees (0-359)
-    output wire signed [8:0] pitch,        // Pitch angle from tilt compensation
-    output wire signed [8:0] roll,         // Roll angle from tilt compensation
-    output reg data_valid,                 // Output data valid pulse
+    // Calibration offset outputs (can be saved for future use)
+    output reg signed [15:0] offset_x,
+    output reg signed [15:0] offset_y,
+    output reg signed [15:0] offset_z,
     
     // Debug outputs
-    output wire mag_error,                 // I2C error flag
-    output wire mag_busy,                  // I2C busy flag
-    output wire [7:0] mag_x_debug,         // Raw mag X for debug
-    output wire signed [15:0] mag_x_raw,   // NEW: Full raw X value
-    output wire signed [15:0] mag_y_raw    // NEW: Full raw Y value
+    output wire [3:0] dbg_i2c_state, // I2C master state
+    output wire [4:0] dbg_mag_state, // Magnetometer driver state
+    
+    // I2C bus
+    inout  wire sda,
+    inout  wire scl
 );
 
-    // ========== Sensor Driver Instance (includes SPI & I2C drivers) ==========
-    wire signed [15:0] mag_x_comp;         // Raw mag X (tilt comp disabled)
-    wire signed [15:0] mag_y_comp;         // Raw mag Y (tilt comp disabled)
-    wire tilt_data_valid;                  // Data ready flag
+    //==========================================================================
+    // MMC34160PJ Constants - FIXED PER DATASHEET EXAMPLES
+    //==========================================================================
+    localparam [6:0] I2C_ADDR = 7'h30;    // 7-bit I2C address (binary 0110000)
     
-    tilt_compensation tilt_inst (
-        .clk(clk),
-        .iclk(iclk),
-        .reset(reset),
-        .miso(miso),
-        .sclk(sclk),
-        .mosi(mosi),
-        .cs(cs),
-        .sda(sda),
-        .scl(scl),
-        // Test inputs - pass through from module ports
-        .acl_data(acl_data),
-        .mag_x(mag_x),
-        .mag_y(mag_y),
-        .mag_z(mag_z),
-        // Outputs
-        .mag_x_comp(mag_x_comp),
-        .mag_y_comp(mag_y_comp),
-        .mag_x_raw(mag_x_raw),      // Get raw magnetometer data
-        .mag_y_raw(mag_y_raw),      // Get raw magnetometer data
-        .pitch(pitch),
-        .roll(roll),
-        .data_valid(tilt_data_valid),
-        .mag_error_out(mag_error),
-        .mag_busy_out(mag_busy),
-        .mag_x_debug(mag_x_debug)
-    );
+    // Register addresses - Following datasheet Quick Start pseudocode (page 6)
+    localparam [7:0] REG_XOUT_LSB = 8'h00;  // X axis output LSB
+    localparam [7:0] REG_CTRL0    = 8'h07;  // Internal Control 0 (per datasheet pg 6)
+    localparam [7:0] REG_STATUS   = 8'h07;  // Status register (same as CTRL0? datasheet unclear)
+    localparam [7:0] REG_CTRL1    = 8'h09;  // Internal Control 1
+    
+    // Control register 0 bits
+    localparam [7:0] CTRL0_REFILL = 8'h80;  // Refill capacitor
+    localparam [7:0] CTRL0_RESET  = 8'h40;  // Reset sensor
+    localparam [7:0] CTRL0_SET    = 8'h20;  // Set sensor
+    localparam [7:0] CTRL0_TM_M   = 8'h01;  // Take Measurement
+    
+    // Control register 1 bits
+    localparam [7:0] CTRL1_SW_RST = 8'h80;  // Software reset
 
-    // ========== 8-DIRECTION COMPASS CALCULATION ==========
-    // Maps magnetometer readings to 8 cardinal/intercardinal directions
-    // N=0°, NE=45°, E=90°, SE=135°, S=180°, SW=225°, W=270°, NW=315°
+    //==========================================================================
+    // I2C Master Interface
+    //==========================================================================
+    reg         i2c_start;
+    reg  [6:0]  i2c_device_addr;
+    reg  [7:0]  i2c_reg_addr;
+    reg         i2c_rw;
+    reg  [2:0]  i2c_num_bytes;
+    reg  [7:0]  i2c_wr_data;
     
-    // AXIS CORRECTION: Your sensor is rotated 225° (or -135°) from standard
-    // We need to rotate the coordinate system BEFORE calculating sectors
-    // Rotation by -135° (or +225°):
-    //   X_new = X*cos(-135°) - Y*sin(-135°) = -0.707*X + 0.707*Y = (Y-X)/sqrt(2)
-    //   Y_new = X*sin(-135°) + Y*cos(-135°) = -0.707*X - 0.707*Y = -(X+Y)/sqrt(2)
-    //
-    // Simplified (ignoring sqrt(2) scaling since we only care about ratios):
-    //   X_new ≈ Y - X  (North-South axis after rotation)
-    //   Y_new ≈ -(X + Y)  (East-West axis after rotation)
+    wire [7:0]  i2c_rd_data;
+    wire        i2c_rd_valid;
+    wire        i2c_busy;
+    wire        i2c_done;
+    wire        i2c_error;
+    wire [3:0]  i2c_dbg_state;
     
-    wire signed [16:0] mag_x_extended = {mag_x_raw[15], mag_x_raw};
-    wire signed [16:0] mag_y_extended = {mag_y_raw[15], mag_y_raw};
+    i2c_master #(
+        .CLK_HZ(CLK_HZ),
+        .I2C_HZ(100_000)    // 100kHz for reliability
+    ) i2c (
+        .clk(clk),
+        .rst(rst),
+        .start(i2c_start),
+        .device_addr(i2c_device_addr),
+        .reg_addr(i2c_reg_addr),
+        .rw(i2c_rw),
+        .num_bytes(i2c_num_bytes),
+        .wr_data(i2c_wr_data),
+        .rd_data(i2c_rd_data),
+        .rd_valid(i2c_rd_valid),
+        .busy(i2c_busy),
+        .done(i2c_done),
+        .error(i2c_error),
+        .debug_state(i2c_dbg_state),
+        .sda(sda),
+        .scl(scl)
+    );
     
-    wire signed [16:0] mag_x_rotated = mag_y_extended - mag_x_extended;  // Y - X
-    wire signed [16:0] mag_y_rotated = -(mag_x_extended + mag_y_extended); // -(X + Y)
+    // Debug outputs
+    assign dbg_i2c_state = i2c_dbg_state;
+    assign dbg_mag_state = state;
+
+    //==========================================================================
+    // FSM States - SIMPLIFIED (No Status Check)
+    //==========================================================================
+    localparam [4:0]
+        S_IDLE           = 5'd0,
+        S_TRIG_START     = 5'd1,   // Start trigger measurement write
+        S_TRIG_WAIT      = 5'd2,   // Wait for trigger to complete
+        S_MEAS_DELAY     = 5'd3,   // Wait for measurement to complete (10ms)
+        S_READ_START     = 5'd4,   // Start 6-byte read
+        S_READ_WAIT      = 5'd5,   // Wait for read to complete
+        S_DONE           = 5'd6;   // Process and output data
     
-    // Truncate back to 16 bits (keep upper bits for better range)
-    wire signed [15:0] mag_x_use = mag_x_rotated[15:0];
-    wire signed [15:0] mag_y_use = mag_y_rotated[15:0];
+    reg [4:0] state;
+    reg [2:0] byte_cnt;
+    reg [7:0] byte0, byte1, byte2, byte3, byte4, byte5;
+    reg [25:0] delay_cnt;       // Counter for delays
     
-    // Deadband threshold
-    localparam signed [15:0] DEADBAND = 16'sd10;
+    // Calibration not implemented in this simplified version
+    reg calibrated;
     
-    // Sign detection
-    wire x_pos = (mag_x_use > DEADBAND);
-    wire x_neg = (mag_x_use < -DEADBAND);
-    wire y_pos = (mag_y_use > DEADBAND);
-    wire y_neg = (mag_y_use < -DEADBAND);
-    wire x_zero = !x_pos && !x_neg;
-    wire y_zero = !y_pos && !y_neg;
-    
-    // Absolute values
-    wire [15:0] abs_x = mag_x_use[15] ? (-mag_x_use) : mag_x_use;
-    wire [15:0] abs_y = mag_y_use[15] ? (-mag_y_use) : mag_y_use;
-    
-    // ========== SECTOR DETERMINATION ==========
-    // Divide the compass into 8 sectors of 45° each
-    // Sector boundaries at: 22.5°, 67.5°, 112.5°, 157.5°, 202.5°, 247.5°, 292.5°, 337.5°
-    //
-    // To determine sector, we check if |Y|/|X| is:
-    //   < tan(22.5°) ≈ 0.414 ≈ 2/5   → near X-axis (N or S)
-    //   > tan(67.5°) ≈ 2.414 ≈ 12/5  → near Y-axis (E or W)
-    //   in between                   → diagonal (NE, SE, SW, or NW)
-    
-    // Calculate thresholds: 
-    // 0.414 ≈ 2/5, so Y < (2*X)/5 means close to X-axis
-    // 2.414 ≈ 12/5, so Y > (12*X)/5 means close to Y-axis
-    
-    wire [16:0] threshold_low  = {1'b0, abs_x} + ({1'b0, abs_x} >> 2);  // X * 1.25 ≈ X * 5/4 (inverse of 4/5)
-    wire [16:0] threshold_high = {1'b0, abs_x} + {1'b0, abs_x};         // X * 2
-    
-    // Determine if we're in a cardinal or diagonal sector
-    wire near_x_axis = (abs_y < abs_x) && ({1'b0, abs_y} * 17'd5 < {1'b0, abs_x} * 17'd2);  // Y/X < 2/5 (22.5°)
-    wire near_y_axis = (abs_y > abs_x) && ({1'b0, abs_y} * 17'd5 > {1'b0, abs_x} * 17'd12); // Y/X > 12/5 (67.5°)
-    wire diagonal    = !near_x_axis && !near_y_axis;
-    
-    // ========== 8-DIRECTION HEADING CALCULATION ==========
-    reg [8:0] heading_calc;
-    
-    always @(*) begin
-        // Default to North if signal too weak
-        if (x_zero && y_zero) begin
-            heading_calc = 9'd0;
-        end
-        // ===== CARDINALS =====
-        else if (near_x_axis && x_pos) begin
-            heading_calc = 9'd0;    // NORTH (within ±22.5° of due North)
-        end
-        else if (near_x_axis && x_neg) begin
-            heading_calc = 9'd180;  // SOUTH (within ±22.5° of due South)
-        end
-        else if (near_y_axis && y_pos) begin
-            heading_calc = 9'd90;   // EAST (within ±22.5° of due East)
-        end
-        else if (near_y_axis && y_neg) begin
-            heading_calc = 9'd270;  // WEST (within ±22.5° of due West)
-        end
-        // ===== INTERCARDINALS (DIAGONALS) =====
-        else if (diagonal && x_pos && y_pos) begin
-            heading_calc = 9'd45;   // NORTHEAST (22.5° to 67.5°)
-        end
-        else if (diagonal && x_neg && y_pos) begin
-            heading_calc = 9'd135;  // SOUTHEAST (112.5° to 157.5°)
-        end
-        else if (diagonal && x_neg && y_neg) begin
-            heading_calc = 9'd225;  // SOUTHWEST (202.5° to 247.5°)
-        end
-        else if (diagonal && x_pos && y_neg) begin
-            heading_calc = 9'd315;  // NORTHWEST (292.5° to 337.5°)
-        end
-        // ===== EDGE CASES: Pure cardinal axes =====
-        else if (x_pos && y_zero) begin
-            heading_calc = 9'd0;    // Pure North
-        end
-        else if (x_neg && y_zero) begin
-            heading_calc = 9'd180;  // Pure South
-        end
-        else if (x_zero && y_pos) begin
-            heading_calc = 9'd90;   // Pure East
-        end
-        else if (x_zero && y_neg) begin
-            heading_calc = 9'd270;  // Pure West
-        end
-        // Default fallback
-        else begin
-            heading_calc = 9'd0;
+    // MMC34160PJ zero-field offset (sensor outputs 32768 at zero field)
+    localparam [15:0] SENSOR_MIDPOINT = 16'd32768;
+
+    //==========================================================================
+    // Capture incoming read bytes
+    //==========================================================================
+    always @(posedge clk) begin
+        if (rst) begin
+            byte_cnt <= 0;
+            byte0 <= 0; byte1 <= 0; byte2 <= 0;
+            byte3 <= 0; byte4 <= 0; byte5 <= 0;
+        end else if (state == S_READ_START) begin
+            byte_cnt <= 0;
+        end else if (i2c_rd_valid && state == S_READ_WAIT) begin
+            case (byte_cnt)
+                3'd0: byte0 <= i2c_rd_data;
+                3'd1: byte1 <= i2c_rd_data;
+                3'd2: byte2 <= i2c_rd_data;
+                3'd3: byte3 <= i2c_rd_data;
+                3'd4: byte4 <= i2c_rd_data;
+                3'd5: byte5 <= i2c_rd_data;
+                default: ;
+            endcase
+            byte_cnt <= byte_cnt + 1;
         end
     end
-    
-    // ========== Register Output with Calibration Offset ==========
-    // TEMPORARY: Offset disabled for debugging - set to 0
-    // Original offset was 138° - you need to calibrate for YOUR board
-    // To calibrate: Point board North, note the reading, then set offset = 360 - reading
-    localparam [8:0] HEADING_OFFSET = 9'd0;  // Changed from 138 to 0 for debugging
-    wire [9:0] adjusted_heading = {1'b0, heading_calc} + {1'b0, HEADING_OFFSET};
-    wire [8:0] normalized_heading = (adjusted_heading >= 10'd360) ? 
-                                    (adjusted_heading[8:0] - 9'd360) : adjusted_heading[8:0];
-    
-    // Update display only every N samples to reduce flicker
-    reg [6:0] update_count;
-    localparam [6:0] UPDATE_INTERVAL = 7'd64;  // Update every 64 samples (~640ms)
-    
-    always @(posedge clk or posedge reset) begin
-        if (reset) begin
-            heading <= 9'd0;
-            update_count <= 0;
-            data_valid <= 1'b0;
+
+    //==========================================================================
+    // Main FSM - SIMPLIFIED
+    //==========================================================================
+    always @(posedge clk) begin
+        if (rst) begin
+            state <= S_IDLE;
+            busy <= 0;
+            data_valid <= 0;
+            calibration_done <= 0;
+            error <= 0;
+            mag_x <= 0;
+            mag_y <= 0;
+            mag_z <= 0;
+            offset_x <= 0;
+            offset_y <= 0;
+            offset_z <= 0;
+            calibrated <= 0;
+            i2c_start <= 0;
+            i2c_device_addr <= I2C_ADDR;
+            i2c_reg_addr <= 0;
+            i2c_rw <= 0;
+            i2c_num_bytes <= 1;
+            i2c_wr_data <= 0;
+            delay_cnt <= 0;
         end else begin
-            data_valid <= 1'b0;
+            // Default: clear pulses
+            data_valid <= 0;
+            calibration_done <= 0;
+            i2c_start <= 0;
             
-            if (tilt_data_valid) begin
-                update_count <= update_count + 1;
-                
-                // Only update display periodically
-                if (update_count >= UPDATE_INTERVAL) begin
-                    update_count <= 0;
-                    heading <= normalized_heading;
+            case (state)
+                //--------------------------------------------------------------
+                S_IDLE: begin
+                    busy <= 0;
+                    if (start_read) begin
+                        busy <= 1;
+                        error <= 0;  // Clear error on new read
+                        state <= S_TRIG_START;
+                    end
                 end
                 
-                data_valid <= 1'b1;
-            end
+                //==============================================================
+                // SIMPLIFIED MEASUREMENT SEQUENCE - Per Datasheet Quick Start
+                //==============================================================
+                S_TRIG_START: begin
+                    i2c_device_addr <= I2C_ADDR;
+                    i2c_reg_addr <= REG_CTRL0;  // Now 0x07 per datasheet
+                    i2c_rw <= 0;  // Write
+                    i2c_num_bytes <= 1;
+                    i2c_wr_data <= CTRL0_TM_M;  // 0x01 to trigger measurement
+                    i2c_start <= 1;
+                    state <= S_TRIG_WAIT;
+                end
+                
+                S_TRIG_WAIT: begin
+                    if (i2c_done) begin
+                        if (i2c_error) begin
+                            error <= 1;
+                            state <= S_IDLE;
+                        end else begin
+                            delay_cnt <= 0;
+                            state <= S_MEAS_DELAY;
+                        end
+                    end
+                end
+                
+                S_MEAS_DELAY: begin
+                    // Wait 10ms for measurement to complete (1,000,000 cycles at 100MHz)
+                    // Datasheet says minimum 7.92ms for 16-bit resolution
+                    if (delay_cnt >= 26'd1_000_000) begin
+                        state <= S_READ_START;
+                    end else begin
+                        delay_cnt <= delay_cnt + 1;
+                    end
+                end
+                
+                S_READ_START: begin
+                    i2c_device_addr <= I2C_ADDR;
+                    i2c_reg_addr <= REG_XOUT_LSB;  // 0x00
+                    i2c_rw <= 1;  // Read
+                    i2c_num_bytes <= 3'd6;  // Read all 6 bytes (X,Y,Z)
+                    i2c_start <= 1;
+                    state <= S_READ_WAIT;
+                end
+                
+                S_READ_WAIT: begin
+                    if (i2c_done) begin
+                        if (i2c_error) begin
+                            error <= 1;
+                            state <= S_IDLE;
+                        end else begin
+                            state <= S_DONE;
+                        end
+                    end
+                end
+                
+                S_DONE: begin
+                    // Assemble raw 16-bit unsigned values and convert to signed
+                    // MMC34160PJ outputs unsigned values: 0=max negative, 32768=zero, 65535=max positive
+                    // Subtract sensor midpoint (32768) to get signed value
+                    mag_x <= $signed({1'b0, byte1, byte0}) - $signed(17'd32768);
+                    mag_y <= $signed({1'b0, byte3, byte2}) - $signed(17'd32768);
+                    mag_z <= $signed({1'b0, byte5, byte4}) - $signed(17'd32768);
+                    data_valid <= 1;
+                    state <= S_IDLE;
+                end
+                
+                default: state <= S_IDLE;
+            endcase
         end
     end
 
