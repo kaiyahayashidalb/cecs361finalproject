@@ -93,18 +93,27 @@ module heading_calculation (
         .mag_x_debug(mag_x_debug)
     );
 
-    // ========== 16-DIRECTION COMPASS CALCULATION ==========
-    // Maps magnetometer readings to 16 directions (22.5° resolution)
-    // N=0°, NNE=22.5°, NE=45°, ENE=67.5°, E=90°, ESE=112.5°, SE=135°, SSE=157.5°,
-    // S=180°, SSW=202.5°, SW=225°, WSW=247.5°, W=270°, WNW=292.5°, NW=315°, NNW=337.5°
+    // ========== 8-DIRECTION COMPASS CALCULATION ==========
+    // Maps magnetometer readings to 8 cardinal/intercardinal directions
+    // N=0°, NE=45°, E=90°, SE=135°, S=180°, SW=225°, W=270°, NW=315°
     
     // AXIS CORRECTION: Your sensor is rotated 225° (or -135°) from standard
+    // We need to rotate the coordinate system BEFORE calculating sectors
+    // Rotation by -135° (or +225°):
+    //   X_new = X*cos(-135°) - Y*sin(-135°) = -0.707*X + 0.707*Y = (Y-X)/sqrt(2)
+    //   Y_new = X*sin(-135°) + Y*cos(-135°) = -0.707*X - 0.707*Y = -(X+Y)/sqrt(2)
+    //
+    // Simplified (ignoring sqrt(2) scaling since we only care about ratios):
+    //   X_new ≈ Y - X  (North-South axis after rotation)
+    //   Y_new ≈ -(X + Y)  (East-West axis after rotation)
+    
     wire signed [16:0] mag_x_extended = {mag_x_raw[15], mag_x_raw};
     wire signed [16:0] mag_y_extended = {mag_y_raw[15], mag_y_raw};
     
     wire signed [16:0] mag_x_rotated = mag_y_extended - mag_x_extended;  // Y - X
     wire signed [16:0] mag_y_rotated = -(mag_x_extended + mag_y_extended); // -(X + Y)
     
+    // Truncate back to 16 bits (keep upper bits for better range)
     wire signed [15:0] mag_x_use = mag_x_rotated[15:0];
     wire signed [15:0] mag_y_use = mag_y_rotated[15:0];
     
@@ -123,112 +132,118 @@ module heading_calculation (
     wire [15:0] abs_x = mag_x_use[15] ? (-mag_x_use) : mag_x_use;
     wire [15:0] abs_y = mag_y_use[15] ? (-mag_y_use) : mag_y_use;
     
-    // ========== 16-SECTOR DETERMINATION ==========
-    // Divide compass into 16 equal sectors of 22.5° each
-    // Sector boundaries at: 11.25°, 33.75°, 56.25°, 78.75° (and equivalents in other quadrants)
+    // ========== SECTOR DETERMINATION ==========
+    // Divide the compass into 16 sectors of 22.5° each
+    // Sector boundaries at: 11.25°, 33.75°, 56.25°, 78.75°, etc.
     //
-    // For equal sectors, we need: tan(11.25°) ≈ 0.199, tan(33.75°) ≈ 0.668, tan(56.25°) ≈ 1.496, tan(78.75°) ≈ 5.027
+    // 16 directions: N, NNE, NE, ENE, E, ESE, SE, SSE, S, SSW, SW, WSW, W, WNW, NW, NNW
+    // Degrees:       0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5, 180, 202.5, 225, 247.5, 270, 292.5, 315, 337.5
     //
-    // Using bit-shifts for hardware efficiency:
-    // tan(11.25°) ≈ 0.199 ≈ 51/256 ≈ X>>2 - X>>4 (0.1875, close enough)
-    // tan(33.75°) ≈ 0.668 ≈ 171/256 ≈ 2/3
-    // tan(56.25°) ≈ 1.496 ≈ 3/2
-    // tan(78.75°) ≈ 5.027 ≈ 5
+    // To determine sector, we check Y/X ratio against tan values:
+    //   tan(11.25°) ≈ 0.199 ≈ 1/5
+    //   tan(33.75°) ≈ 0.668 ≈ 2/3
+    //   tan(56.25°) ≈ 1.497 ≈ 3/2
+    //   tan(78.75°) ≈ 5.027 ≈ 5/1
     
-    wire [16:0] abs_x_17 = {1'b0, abs_x};
-    wire [16:0] abs_y_17 = {1'b0, abs_y};
+    // Multiply to avoid division: compare abs_y * denom vs abs_x * numer
+    wire [31:0] y_times_5 = {16'b0, abs_y} * 32'd5;
+    wire [31:0] x_times_1 = {16'b0, abs_x};
+    wire [31:0] y_times_3 = {16'b0, abs_y} * 32'd3;
+    wire [31:0] x_times_2 = {16'b0, abs_x} * 32'd2;
+    wire [31:0] y_times_2 = {16'b0, abs_y} * 32'd2;
+    wire [31:0] x_times_3 = {16'b0, abs_x} * 32'd3;
+    wire [31:0] y_times_1 = {16'b0, abs_y};
+    wire [31:0] x_times_5 = {16'b0, abs_x} * 32'd5;
     
-    // Precise sector boundaries for equal 22.5° sectors
-    // Boundary 1: 11.25° → tan = 0.199 ≈ 1/5
-    wire [17:0] boundary1_x = {abs_x_17, 1'b0} + (abs_x_17 << 1);  // 5X for comparison
-    wire sector1 = (abs_y_17 * 5'd5) < boundary1_x;                 // Y/X < 0.2 (±11.25°)
+    // Ratio comparisons (Y/X compared to threshold)
+    wire ratio_lt_0p2 = (y_times_5 < x_times_1);           // Y/X < 1/5 (< 11.25°)
+    wire ratio_lt_0p67 = (y_times_3 < x_times_2);          // Y/X < 2/3 (< 33.75°)
+    wire ratio_lt_1p5 = (y_times_2 < x_times_3);           // Y/X < 3/2 (< 56.25°)
+    wire ratio_lt_5 = (y_times_1 < x_times_5);             // Y/X < 5/1 (< 78.75°)
     
-    // Boundary 2: 33.75° → tan = 0.668 ≈ 2/3
-    wire [17:0] boundary2_x = abs_x_17 + (abs_x_17 >> 1);          // 1.5X
-    wire sector2 = (abs_y_17 + (abs_y_17 >> 1)) < boundary2_x;     // Y*1.5 < X*1.5 → Y < X*2/3
+    // Determine which of 5 zones we're in (for one quadrant)
+    // Zone 0: 0° to 11.25° (cardinal)
+    // Zone 1: 11.25° to 33.75° (secondary intercardinal)
+    // Zone 2: 33.75° to 56.25° (primary intercardinal)
+    // Zone 3: 56.25° to 78.75° (secondary intercardinal)
+    // Zone 4: 78.75° to 90° (cardinal)
     
-    // Boundary 3: 56.25° → tan = 1.496 ≈ 3/2
-    wire [17:0] boundary3_y = abs_y_17 + (abs_y_17 >> 1);          // 1.5Y
-    wire sector3 = abs_x_17 < boundary3_y;                          // X < 1.5Y → Y/X > 2/3
-    
-    // Boundary 4: 78.75° → tan = 5.027 ≈ 5
-    wire [18:0] boundary4_y = (abs_y_17 << 2) + abs_y_17;          // 5Y
-    wire sector4 = abs_x_17 < boundary4_y;                          // X < 5Y → Y/X > 1/5
+    wire [2:0] angle_zone;
+    assign angle_zone = ratio_lt_0p2  ? 3'd0 :   // Very close to X axis
+                        ratio_lt_0p67 ? 3'd1 :   // Between cardinal and diagonal
+                        ratio_lt_1p5  ? 3'd2 :   // Close to 45° diagonal
+                        ratio_lt_5    ? 3'd3 :   // Between diagonal and Y axis
+                                        3'd4;    // Very close to Y axis
     
     // ========== 16-DIRECTION HEADING CALCULATION ==========
-    // Each sector covers exactly 22.5° (360°/16)
-    // Sectors centered at: 0°, 22.5°, 45°, 67.5°, 90°, 112.5°, 135°, 157.5°, 180°, 202.5°, 225°, 247.5°, 270°, 292.5°, 315°, 337.5°
-    // Boundaries at: ±11.25° from center
-    
     reg [8:0] heading_calc;
     
     always @(*) begin
+        // Default to North if signal too weak
         if (x_zero && y_zero) begin
-            heading_calc = 9'd0;  // No signal
+            heading_calc = 9'd0;
         end
-        // ===== QUADRANT 1: X+, Y+ (348.75° to 90°) =====
+        // ===== QUADRANT 1: X+, Y+ (N to E, 0° to 90°) =====
         else if (x_pos && y_pos) begin
-            if (sector1)
-                heading_calc = 9'd0;      // N (348.75° to 11.25°)
-            else if (sector2)
-                heading_calc = 9'd23;     // NNE (11.25° to 33.75°)
-            else if (sector3)
-                heading_calc = 9'd45;     // NE (33.75° to 56.25°)
-            else if (sector4)
-                heading_calc = 9'd68;     // ENE (56.25° to 78.75°)
-            else
-                heading_calc = 9'd90;     // E (78.75° to 101.25°)
+            case (angle_zone)
+                3'd0: heading_calc = 9'd0;    // N (0°)
+                3'd1: heading_calc = 9'd22;   // NNE (22.5° → 22°)
+                3'd2: heading_calc = 9'd45;   // NE (45°)
+                3'd3: heading_calc = 9'd68;   // ENE (67.5° → 68°)
+                3'd4: heading_calc = 9'd90;   // E (90°)
+                default: heading_calc = 9'd45;
+            endcase
         end
-        // ===== QUADRANT 2: X-, Y+ (78.75° to 180°) =====
+        // ===== QUADRANT 2: X-, Y+ (E to S, 90° to 180°) =====
         else if (x_neg && y_pos) begin
-            if (sector4)
-                heading_calc = 9'd90;     // E (78.75° to 101.25°)
-            else if (sector3)
-                heading_calc = 9'd113;    // ESE (101.25° to 123.75°)
-            else if (sector2)
-                heading_calc = 9'd135;    // SE (123.75° to 146.25°)
-            else if (sector1)
-                heading_calc = 9'd158;    // SSE (146.25° to 168.75°)
-            else
-                heading_calc = 9'd180;    // S (168.75° to 191.25°)
+            case (angle_zone)
+                3'd0: heading_calc = 9'd180;  // S (180°)
+                3'd1: heading_calc = 9'd158;  // SSE (157.5° → 158°)
+                3'd2: heading_calc = 9'd135;  // SE (135°)
+                3'd3: heading_calc = 9'd112;  // ESE (112.5° → 112°)
+                3'd4: heading_calc = 9'd90;   // E (90°)
+                default: heading_calc = 9'd135;
+            endcase
         end
-        // ===== QUADRANT 3: X-, Y- (168.75° to 270°) =====
+        // ===== QUADRANT 3: X-, Y- (S to W, 180° to 270°) =====
         else if (x_neg && y_neg) begin
-            if (sector1)
-                heading_calc = 9'd180;    // S (168.75° to 191.25°)
-            else if (sector2)
-                heading_calc = 9'd203;    // SSW (191.25° to 213.75°)
-            else if (sector3)
-                heading_calc = 9'd225;    // SW (213.75° to 236.25°)
-            else if (sector4)
-                heading_calc = 9'd248;    // WSW (236.25° to 258.75°)
-            else
-                heading_calc = 9'd270;    // W (258.75° to 281.25°)
+            case (angle_zone)
+                3'd0: heading_calc = 9'd180;  // S (180°)
+                3'd1: heading_calc = 9'd202;  // SSW (202.5° → 202°)
+                3'd2: heading_calc = 9'd225;  // SW (225°)
+                3'd3: heading_calc = 9'd248;  // WSW (247.5° → 248°)
+                3'd4: heading_calc = 9'd270;  // W (270°)
+                default: heading_calc = 9'd225;
+            endcase
         end
-        // ===== QUADRANT 4: X+, Y- (258.75° to 360°) =====
+        // ===== QUADRANT 4: X+, Y- (W to N, 270° to 360°) =====
         else if (x_pos && y_neg) begin
-            if (sector4)
-                heading_calc = 9'd270;    // W (258.75° to 281.25°)
-            else if (sector3)
-                heading_calc = 9'd293;    // WNW (281.25° to 303.75°)
-            else if (sector2)
-                heading_calc = 9'd315;    // NW (303.75° to 326.25°)
-            else if (sector1)
-                heading_calc = 9'd338;    // NNW (326.25° to 348.75°)
-            else
-                heading_calc = 9'd0;      // N (348.75° to 11.25°)
+            case (angle_zone)
+                3'd0: heading_calc = 9'd0;    // N (0°/360°)
+                3'd1: heading_calc = 9'd338;  // NNW (337.5° → 338°)
+                3'd2: heading_calc = 9'd315;  // NW (315°)
+                3'd3: heading_calc = 9'd292;  // WNW (292.5° → 292°)
+                3'd4: heading_calc = 9'd270;  // W (270°)
+                default: heading_calc = 9'd315;
+            endcase
         end
-        // ===== PURE AXES =====
-        else if (x_pos)
-            heading_calc = 9'd0;          // N
-        else if (x_neg)
-            heading_calc = 9'd180;        // S
-        else if (y_pos)
-            heading_calc = 9'd90;         // E
-        else if (y_neg)
-            heading_calc = 9'd270;        // W
-        else
-            heading_calc = 9'd0;          // Default
+        // ===== PURE CARDINAL AXES =====
+        else if (x_pos && y_zero) begin
+            heading_calc = 9'd0;    // Pure North
+        end
+        else if (x_neg && y_zero) begin
+            heading_calc = 9'd180;  // Pure South
+        end
+        else if (x_zero && y_pos) begin
+            heading_calc = 9'd90;   // Pure East
+        end
+        else if (x_zero && y_neg) begin
+            heading_calc = 9'd270;  // Pure West
+        end
+        // Default fallback
+        else begin
+            heading_calc = 9'd0;
+        end
     end
     
     // ========== Register Output with Calibration Offset ==========
